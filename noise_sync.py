@@ -15,13 +15,11 @@ Usage:
 
 import asyncio
 import struct
-import time
 import json
-from datetime import datetime, timedelta
-from typing import Optional, Callable
-from bleak import BleakClient, BleakScanner
+from datetime import datetime
+from typing import Optional
+from bleak import BleakClient
 import sys
-import subprocess
 
 # UUIDs for Noise Force (custom protocol)
 SERVICE_CUSTOM = "00006287-3c17-d293-8e48-14fe2e4da212"
@@ -34,6 +32,7 @@ CHAR_HR = "00002a37-0000-1000-8000-00805f9b34fb"
 
 # Protocol Constants
 HEADER = 0x6F
+HEADER_LARGE = 0x6E
 TRAILER = 0x8F
 
 # Command Types
@@ -88,6 +87,20 @@ def parse_response(data: bytes) -> dict:
     if len(data) < 6:
         return {"success": False, "error": "Packet too short", "raw": data.hex()}
     
+    if data[0] not in (HEADER, HEADER_LARGE):
+        return {"success": False, "error": "Invalid header", "raw": data.hex()}
+    
+    payload_len = data[3] | (data[4] << 8)
+    expected_len = 6 + payload_len
+    if len(data) != expected_len:
+        return {
+            "success": False,
+            "error": "Length mismatch",
+            "expected_len": expected_len,
+            "actual_len": len(data),
+            "raw": data.hex(),
+        }
+    
     if data[-1] != TRAILER:
         return {"success": False, "error": "Invalid trailer", "raw": data.hex()}
     
@@ -111,7 +124,9 @@ class NoiseFitSyncDaemon:
         self.mac_address = mac_address
         self.client: Optional[BleakClient] = None
         self._response_event = asyncio.Event()
+        self._response_buffer = bytearray()
         self._response_data = bytearray()
+        self._char_uuid_by_handle = {}
         self._running = False
         self._last_sync = None
         self._hr_notify_enabled = False
@@ -132,8 +147,23 @@ class NoiseFitSyncDaemon:
         
         print("✓ Connected")
         
-        # Get services
-        services = self.client.services
+        # Populate characteristic handle mapping when the backend exposes services.
+        services = None
+        try:
+            services = self.client.services
+        except AttributeError:
+            services = None
+        if not services and hasattr(self.client, "get_services"):
+            try:
+                services = await self.client.get_services()
+            except Exception:
+                services = None
+        if services:
+            for service in services:
+                for char in service.characteristics:
+                    handle = getattr(char, "handle", None)
+                    if handle is not None:
+                        self._char_uuid_by_handle[handle] = char.uuid.lower()
         
         # Hybrid path for Noise Force:
         # - ffd1 / ffd8: likely low-level command channels
@@ -159,17 +189,73 @@ class NoiseFitSyncDaemon:
         
         return True
     
+    def _sender_uuid(self, sender) -> Optional[str]:
+        """Best-effort UUID resolution across Bleak backends."""
+        uuid = getattr(sender, "uuid", None)
+        if uuid:
+            return str(uuid).lower()
+        if isinstance(sender, str):
+            return sender.lower()
+        if isinstance(sender, int):
+            return self._char_uuid_by_handle.get(sender)
+        handle = getattr(sender, "handle", None)
+        if handle is not None:
+            return self._char_uuid_by_handle.get(handle)
+        return None
+    
+    def _extract_response_frame(self) -> Optional[bytes]:
+        """Extract a complete response frame from the ACK buffer."""
+        if not self._response_buffer:
+            return None
+        
+        first = self._response_buffer[0]
+        if first in (HEADER, HEADER_LARGE):
+            if len(self._response_buffer) < 6:
+                return None
+            payload_len = self._response_buffer[3] | (self._response_buffer[4] << 8)
+            frame_len = 6 + payload_len
+            if len(self._response_buffer) < frame_len:
+                return None
+            frame = bytes(self._response_buffer[:frame_len])
+            if frame[-1] != TRAILER:
+                # Resync on malformed frames instead of blocking future responses.
+                del self._response_buffer[:1]
+                return None
+            del self._response_buffer[:frame_len]
+            return frame
+        
+        for idx, value in enumerate(self._response_buffer):
+            if value in (HEADER, HEADER_LARGE):
+                del self._response_buffer[:idx]
+                return None
+        
+        if len(self._response_buffer) >= 3:
+            frame = bytes(self._response_buffer[:3])
+            del self._response_buffer[:3]
+            return frame
+        
+        return None
+    
     def _on_notification(self, sender, data: bytearray):
         """Handle incoming data."""
-        self._response_data.extend(data)
-        self._response_event.set()
+        sender_uuid = self._sender_uuid(sender)
         
         # Parse heart rate if from HR characteristic
-        if "2a37" in sender.uuid.lower():
+        if sender_uuid and "2a37" in sender_uuid:
             hr = self._parse_hr_data(bytes(data))
             if hr:
                 self.last_heart_rate = hr
                 print(f"♥ Heart Rate: {hr} BPM")
+            return
+        
+        if sender_uuid == self._ack_char.lower():
+            self._response_buffer.extend(data)
+            if not self._response_event.is_set():
+                frame = self._extract_response_frame()
+                if frame is not None:
+                    self._response_data.clear()
+                    self._response_data.extend(frame)
+                    self._response_event.set()
     
     def _parse_hr_data(self, data: bytes) -> Optional[int]:
         """Parse heart rate from BLE HR characteristic data."""
@@ -193,6 +279,7 @@ class NoiseFitSyncDaemon:
         packet = build_packet(cmd_type, sub_cmd, data)
         print(f"  TX: {packet.hex()}")
         
+        self._response_buffer.clear()
         self._response_data.clear()
         self._response_event.clear()
         
@@ -236,6 +323,7 @@ class NoiseFitSyncDaemon:
             printable = str(payload)
         print(f"  Payload: {printable}")
         
+        self._response_buffer.clear()
         self._response_data.clear()
         self._response_event.clear()
         
@@ -252,12 +340,20 @@ class NoiseFitSyncDaemon:
             return parse_response(response_data)
         except asyncio.TimeoutError:
             print("  (no ACK)")
-            return {"success": True, "note": "write sent, no ack", "payload": printable, "char": char_uuid}
+            return {
+                "success": False,
+                "acknowledged": False,
+                "sent": True,
+                "note": "write sent, no ack",
+                "payload": printable,
+                "char": char_uuid,
+            }
     
     async def _write_chunked(self, label: str, char_uuid: str, payload: bytes, chunk_size: int = 20, response: bool = False, gap: float = 0.05):
         """Write a long payload in BLE-sized chunks."""
         print(f"\n  Trying chunked path: {label}")
         print(f"  Total bytes: {len(payload)}")
+        self._response_buffer.clear()
         self._response_data.clear()
         self._response_event.clear()
         for i in range(0, len(payload), chunk_size):
@@ -272,7 +368,7 @@ class NoiseFitSyncDaemon:
             return parse_response(response_data)
         except asyncio.TimeoutError:
             print("  (no ACK)")
-            return {"success": True, "note": "chunked write sent, no ack"}
+            return {"success": False, "acknowledged": False, "sent": True, "note": "chunked write sent, no ack"}
     
     async def sync_time(self, debug: bool = True) -> dict:
         """Sync watch time using packet and raw legacy probes."""
@@ -290,6 +386,9 @@ class NoiseFitSyncDaemon:
         print("  Watch currently shows: 2021-06-06 10:18 (WRONG)")
         
         # Stage 1: packet-wrapped formats
+        packet_successes = 0
+        raw_successes = 0
+        json_successes = 0
         packet_formats = [
             ("Year-2000 (packet)", struct.pack('6B', yy2000, now.month, now.day, now.hour, now.minute, now.second)),
             ("Year-2010 (packet)", struct.pack('6B', yy2010, now.month, now.day, now.hour, now.minute, now.second)),
@@ -302,6 +401,8 @@ class NoiseFitSyncDaemon:
             print(f"\n  Trying format: {name}")
             print(f"  Data: {data.hex()}")
             result = await self.send_cmd(CMD_TIME, SUB_SET, data)
+            if result.get("success"):
+                packet_successes += 1
             print(f"  Response: {result}")
         
         # Stage 2: raw writes to legacy channels
@@ -324,7 +425,9 @@ class NoiseFitSyncDaemon:
         
         for payload_name, payload in raw_payloads:
             for path_name, char_uuid, response in raw_paths:
-                await self._write_raw_candidate(f"{path_name} / {payload_name}", char_uuid, payload, response)
+                result = await self._write_raw_candidate(f"{path_name} / {payload_name}", char_uuid, payload, response)
+                if result.get("success"):
+                    raw_successes += 1
                 if not debug:
                     await asyncio.sleep(0.3)
         
@@ -353,18 +456,36 @@ class NoiseFitSyncDaemon:
         ]
         
         for label, payload in json_packet_candidates:
-            await self._write_raw_candidate(f"6487 / {label}", self._ack_char, payload, True)
-            await self._write_raw_candidate(f"ffd1 / {label}", self._write_char_primary, payload, False)
-            await self._write_raw_candidate(f"ffd8 / {label}", self._write_char_secondary, payload, False)
+            result = await self._write_raw_candidate(f"6487 / {label}", self._ack_char, payload, True)
+            if result.get("success"):
+                json_successes += 1
+            result = await self._write_raw_candidate(f"ffd1 / {label}", self._write_char_primary, payload, False)
+            if result.get("success"):
+                json_successes += 1
+            result = await self._write_raw_candidate(f"ffd8 / {label}", self._write_char_secondary, payload, False)
+            if result.get("success"):
+                json_successes += 1
         
         # fff2 rejects variable lengths, so try 20-byte chunked JSON there
         try:
-            await self._write_chunked("fff2 / raw json chunked", self._write_char_fff2, json_bytes, chunk_size=20, response=True)
+            result = await self._write_chunked("fff2 / raw json chunked", self._write_char_fff2, json_bytes, chunk_size=20, response=True)
+            if result.get("success"):
+                json_successes += 1
         except Exception as e:
             print(f"  fff2 chunked failed: {e}")
         
-        self._last_sync = now
-        return {"success": True, "tried_packet": len(packet_formats), "tried_raw": len(raw_payloads) * len(raw_paths), "tried_json": len(json_packet_candidates)}
+        success = (packet_successes + raw_successes + json_successes) > 0
+        if success:
+            self._last_sync = now
+        return {
+            "success": success,
+            "tried_packet": len(packet_formats),
+            "tried_raw": len(raw_payloads) * len(raw_paths),
+            "tried_json": len(json_packet_candidates),
+            "packet_successes": packet_successes,
+            "raw_successes": raw_successes,
+            "json_successes": json_successes,
+        }
     
     async def read_battery(self) -> dict:
         """Read battery level."""
@@ -485,7 +606,11 @@ class NoiseFitSyncDaemon:
         print(f"{'='*50}")
         
         # Sync time
-        await self.sync_time()
+        time_sync = await self.sync_time()
+        if time_sync.get("success"):
+            print(f"  Time sync acknowledged ({time_sync['packet_successes'] + time_sync['raw_successes'] + time_sync['json_successes']} successful response(s))")
+        else:
+            print("  Time sync: no acknowledged response")
         
         # Read battery
         battery = await self.read_battery()
