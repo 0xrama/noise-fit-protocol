@@ -1,7 +1,66 @@
 # NoiseFit Reverse Engineering Progress Log
 
-**Date:** 2026-04-01  
-**Status:** In Progress - Time Sync Issue  
+**Last updated:** 2026-06-13
+**Status:** ✅ SOLVED & VERIFIED ON HARDWARE — full pipeline working against the real watch
+
+> **2026-06-13 (late):** Ran the rewritten `noise_sync.py` against the actual
+> NoiseFit Twist (via the Mac's Bluetooth, `uv run --with bleak`). **Everything works:**
+> connect+auth, **time sync (the 2021 bug — fixed)**, device info, battery, **steps**
+> (live, 2109 today), **heart rate** (live, 86 samples 67–103 bpm, multi-fragment),
+> and graceful no-data for sleep/SpO2 (none recorded yet today).
+> Two real bugs found & fixed while testing: (1) the transport replied READY/DONE on
+> the wrong characteristic — it must reply on the same char the peer notified on;
+> (2) notifications were processed as concurrent tasks, racing the reassembly buffer
+> on multi-fragment responses — now serialized through one FIFO consumer, and each
+> fitness exchange fully syncs (await the op115 confirm ack) before the next.
+> The old notes below are kept for archaeology — **do not trust them.**
+
+> **2026-06-13 update:** The entire premise below was wrong, and is now SOLVED.
+> See [`NOISE_TWIST_PROTOCOL.md`](NOISE_TWIST_PROTOCOL.md) (the real protocol) and
+> [`HANDOFF.md`](HANDOFF.md) (provenance + remaining work). The notes from 2026-04-01
+> are kept below for archaeology — **do not trust them**; they describe a different
+> (AppsComm) watch and incorrect UUIDs.
+
+---
+
+## 2026-06-13 — THE BREAKTHROUGH
+
+**What happened:** A fresh bugreport from a **Moto G** (`cancunf` build) contained a
+valid `btsnoop_hci.log` at `captures/btsnoop_hci.log` (extracted from the Moto bugreport) — the exact
+artifact the OnePlus refused to emit. This single file rewrote the entire protocol model.
+
+**Key findings (all cross-checked against the decompiled APK's protobuf descriptors):**
+
+1. **The watch is a NoiseFit Twist** (model `32005`, firmware `1.2.1`), NOT "Noise Force".
+   The `FA:DA:48:C9:F0:F1` MAC and `6287/ffd1/6487/fee1` UUIDs were all wrong.
+2. **The protocol is protobuf**, not the `6F…8F` AppsComm frame. GATT service
+   `16186f00-…-00807f9b34fb`, write char `16186f02` (handle 0x0009), notify char
+   `16186f01` (handle 0x0006), with a credit-flow transport (`ANNOUNCE/READY/DONE`).
+3. **Time sync SOLVED.** The real packet is `SEWear{ id=48, system_time{ time_set{
+   timestamp=UnixEpoch, offset=zigzag(tz_quarter_hours) } } }`. The "stuck in 2021" bug
+   was purely the wrong protocol. Verified byte-for-byte against the capture.
+4. **Auth = op19 VERIFY_USER_NUMBER** with server-issued token `74ab0695194975372`.
+5. **Health data decoded:** steps/distance/calories (u16 BE, hourly), heart rate (u8 BPM,
+   5-min buckets — 56 real samples, 67–103 bpm). Sleep and SpO2 are schema-supported
+   but weren't advertised on 2026-06-13.
+
+**Deliverables produced this session:**
+- `noise_sync.py` — **rewritten** for the real protobuf protocol (compiles; all message
+  builders verified byte-exact against the capture). Supports time sync, device info,
+  battery, steps/HR/sleep/SpO2 pull.
+- `NOISE_TWIST_PROTOCOL.md` — complete, corrected protocol doc.
+- `HANDOFF.md` — full handoff with sources, remaining work, and open risks.
+- `parse_btsnoop.py` — btsnoop → ATT decoder for analyzing future captures.
+
+**Remaining work:** test the rewritten client against the real watch (needs the physical
+device + `bleak`); confirm sleep/SpO2 decoding once a capture with that data exists.
+
+---
+
+# 2026-04-01 (ARCHIVED — superseded; wrong protocol model)
+
+**Date:** 2026-04-01
+**Status:** In Progress - Time Sync Issue
 **Last Action:** HCI Snoop capture attempts failed (phone restriction suspected)
 
 ---

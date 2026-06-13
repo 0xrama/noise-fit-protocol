@@ -1,756 +1,681 @@
 """
-NoiseFit Sync Daemon - Full Featured Client
-============================================
+NoiseFit Twist Sync Client
+==========================
 
-Features:
-- Time sync (fixes your 2021 issue!)
-- Real-time heart rate monitoring
-- Step count & sleep data sync
-- Mac notification forwarding
-- Periodic sync every 30 minutes
+Reverse-engineered client for the NoiseFit Twist smartwatch. This replaces the old
+6F/8F "AppsComm" model — the Twist actually speaks **protobuf** over a custom GATT
+service with a credit-based flow-control transport.
+
+Everything here is verified against a real btsnoop capture (captured via a Moto G
+bugreport) AND the decompiled NoiseFit APK's own protobuf descriptors. See
+NOISE_TWIST_PROTOCOL.md for the full protocol and HANDOFF.md for provenance.
+
+Capabilities:
+  --time      Sync the phone time to the watch (the fix for the 2021-06-06 bug)
+  --info      Read firmware / model / MAC / serial / battery
+  --battery   Battery level
+  --steps     Pull today's step/distance/calorie series (hourly)
+  --hr        Pull today's continuous heart-rate series (5-min buckets)
+  --sleep     Pull today's sleep data
+  --spo2      Pull today's blood-oxygen series
+  --all       Time + info + all health data
 
 Usage:
-    uv run noise_sync.py 2DE08656-A97F-79F8-94B1-7CF03FE26FE0 --daemon
+  python noise_sync.py 14:55:b9:5a:c9:fa --time
+  python noise_sync.py 14:55:b9:5a:c9:fa --all
+
+Requires: bleak  (pip install bleak)
 """
 
+import argparse
 import asyncio
+import datetime
+import os
 import struct
-import json
-from datetime import datetime
-from typing import Optional
-from bleak import BleakClient
 import sys
+from typing import Optional
 
-# UUIDs for Noise Force (custom protocol)
-SERVICE_CUSTOM = "00006287-3c17-d293-8e48-14fe2e4da212"
-CHAR_WRITE_NOTIFY = "00006487-3c17-d293-8e48-14fe2e4da212"
-
-# Standard BLE services
-CHAR_BATTERY = "00002a19-0000-1000-8000-00805f9b34fb"
-SERVICE_HR = "0000180d-0000-1000-8000-00805f9b34fb"
-CHAR_HR = "00002a37-0000-1000-8000-00805f9b34fb"
-
-# Protocol Constants
-HEADER = 0x6F
-HEADER_LARGE = 0x6E
-TRAILER = 0x8F
-
-# Command Types
-CMD_VERSION = 0x01
-CMD_BIND_START = 0x03
-CMD_BIND_END = 0x05
-CMD_TIME = 0x04
-CMD_GET_SPORT_DATA = 0x52  # Data sync command
-CMD_GET_SLEEP_DATA = 0x52  # Same category, different sub
-
-# Sub-commands
-SUB_GET = 0x70
-SUB_SET = 0x71
-
-# Notification types
-MSG_SMS = 0x01
-MSG_CALL = 0x05
-MSG_MISSED_CALL = 0x00
+try:
+    from bleak import BleakClient
+except ImportError:
+    print("ERROR: bleak is not installed.  pip install bleak", file=sys.stderr)
+    sys.exit(1)
 
 
-def build_packet(cmd_type: int, sub_cmd: int, data: bytes = b"") -> bytes:
-    """Build a standard command packet."""
-    length = len(data)
-    packet = bytearray()
-    packet.append(HEADER)
-    packet.append(cmd_type)
-    packet.append(sub_cmd)
-    packet.append(length & 0xFF)
-    packet.append((length >> 8) & 0xFF)
-    packet.extend(data)
-    packet.append(TRAILER)
-    return bytes(packet)
+# ─────────────────────────────────────────────────────────────────────────────
+# GATT UUIDs  (service 16186f00-...-00807f9b34fb)
+# ─────────────────────────────────────────────────────────────────────────────
+UUID_SERVICE = "16186f00-0000-1000-8000-00807f9b34fb"
+UUID_RX = "16186f01-0000-1000-8000-00807f9b34fb"   # watch → phone  (handle 0x0006)
+UUID_TX = "16186f02-0000-1000-8000-00807f9b34fb"   # phone → watch  (handle 0x0009)
+UUID_FC = "16186f04-0000-1000-8000-00807f9b34fb"   # flow-control / NACK (handle 0x000f)
+
+# Opcodes (SEWear.SEFunctionId) — the subset we use.
+OP_CONNECT_PARAM = 0
+OP_INQUIRY_BINDING = 16
+OP_VERIFY_USER = 19
+OP_GET_DEVICE_INFO = 32
+OP_GET_BATTERY = 33
+OP_SET_TIME = 48
+OP_SET_TIME_FORMAT = 49
+OP_GET_FITNESS_TYPES = 112
+OP_REQUEST_FITNESS = 113
+OP_CONFIRM_FITNESS = 115
+OP_SYNC_DONE = 117
+
+# Fitness function types (SEFitnessFunctionType)
+FT_DAILY = 0      # steps / distance / calories   (continuous, keyed to 00:00)
+FT_SLEEP = 1
+FT_HR = 2          # continuous heart rate          (continuous, keyed to 00:00)
+FT_SPO2_CONT = 4   # continuous blood oxygen
+FT_SPO2 = 5        # offline (spot) SpO2 measurement  (keyed to measurement time)
+FT_PRESSURE_CONT = 6  # continuous pressure/stress
+FT_STRESS = 7      # offline (spot) stress/pressure measurement (keyed to time)
+FT_STANDING = 11
+FT_ACTIVITY = 12
+
+# Which SEFitness payload field holds each offline measurement type:
+#   SEFitness: 8=cont_spo2, 9=offline_spo2, 10=cont_pressure, 11=offline_pressure
+OFFLINE_FITNESS_FIELD = {FT_SPO2: 9, FT_STRESS: 11}
+
+# Known bound-device token, captured from the official app. This is a server-issued
+# opaque string (Noise backend /user_detail/watch/watch-token), reused on every
+# reconnect. Valid until the watch is unbound (op23) or factory-reset.
+DEFAULT_TOKEN = "74ab0695194975372"
 
 
-def parse_response(data: bytes) -> dict:
-    """Parse response - handles both legacy and standard formats."""
-    if len(data) == 0:
-        return {"success": False, "error": "Empty response"}
-    
-    # Legacy short response: [STATUS, CMD_ECHO, RESULT]
-    if len(data) == 3:
-        return {
-            "success": data[0] == 0x10 or data[2] == 0x00,
-            "status": data[0],
-            "cmd_echo": data[1],
-            "result": data[2],
-            "format": "legacy_short",
-            "raw": data.hex()
-        }
-    
-    # Standard format
-    if len(data) < 6:
-        return {"success": False, "error": "Packet too short", "raw": data.hex()}
-    
-    if data[0] not in (HEADER, HEADER_LARGE):
-        return {"success": False, "error": "Invalid header", "raw": data.hex()}
-    
-    payload_len = data[3] | (data[4] << 8)
-    expected_len = 6 + payload_len
-    if len(data) != expected_len:
-        return {
-            "success": False,
-            "error": "Length mismatch",
-            "expected_len": expected_len,
-            "actual_len": len(data),
-            "raw": data.hex(),
-        }
-    
-    if data[-1] != TRAILER:
-        return {"success": False, "error": "Invalid trailer", "raw": data.hex()}
-    
-    payload = data[5:-1]
-    success = len(payload) > 0 and payload[0] == 0x00
-    
+# ─────────────────────────────────────────────────────────────────────────────
+# Minimal protobuf codec (encoder + generic decoder). No .proto files needed.
+# ─────────────────────────────────────────────────────────────────────────────
+def _varint(n: int) -> bytes:
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+
+
+def _zigzag_encode(n: int) -> int:
+    return (n << 1) ^ (n >> 31)
+
+
+def pb_field_varint(field: int, value: int) -> bytes:
+    return _varint((field << 3) | 0) + _varint(value)
+
+
+def pb_field_bytes(field: int, data: bytes) -> bytes:
+    return _varint((field << 3) | 2) + _varint(len(data)) + data
+
+
+def pb_field_sint32(field: int, value: int) -> bytes:
+    return pb_field_varint(field, _zigzag_encode(value))
+
+
+def _read_varint(buf, i):
+    value = shift = 0
+    while True:
+        b = buf[i]
+        i += 1
+        value |= (b & 0x7F) << shift
+        shift += 7
+        if not (b & 0x80):
+            return value, i
+
+
+def pb_decode(buf: bytes):
+    """Decode a protobuf buffer into a list of (field, wire_type, value) tuples.
+    wire_type 0 -> int, 2 -> bytes, 1 -> 8 raw bytes, 5 -> 4 raw bytes."""
+    out = []
+    i = 0
+    n = len(buf)
+    while i < n:
+        key, i = _read_varint(buf, i)
+        field, wire = key >> 3, key & 7
+        if wire == 0:
+            value, i = _read_varint(buf, i)
+        elif wire == 1:
+            value, i = buf[i:i + 8], i + 8
+        elif wire == 2:
+            length, i = _read_varint(buf, i)
+            value, i = buf[i:i + length], i + length
+        elif wire == 5:
+            value, i = buf[i:i + 4], i + 4
+        else:
+            break  # unknown wire type; stop
+        out.append((field, wire, value))
+    return out
+
+
+def pb_get(buf: bytes, field: int):
+    """Return the first value (raw) for a given field number, or None."""
+    for f, w, v in pb_decode(buf):
+        if f == field:
+            return v
+    return None
+
+
+def pb_get_all(buf: bytes, field: int):
+    return [v for f, w, v in pb_decode(buf) if f == field]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Credit-flow transport
+# ─────────────────────────────────────────────────────────────────────────────
+CTRL_ANNOUNCE = bytes([0, 0, 0, 0])   # + uint16 count
+CTRL_READY = bytes([0, 0, 1, 1, 0, 0])
+CTRL_DONE = bytes([0, 0, 1, 0, 0, 0])
+FRAG_SIZE = 242                       # MTU 247 - 3 ATT - 2 prefix
+
+
+class Transport:
+    """Implements the Berry credit-flow transport over the two protobuf chars."""
+
+    def __init__(self, client: BleakClient, loop: asyncio.AbstractEventLoop, log):
+        self.client = client
+        self.loop = loop
+        self.log = log
+        self._rx_buf = {}            # char uuid -> {count, frags:{idx:bytes}}
+        self._message_event = asyncio.Event()
+        self._latest = None
+        self._queue: asyncio.Queue = asyncio.Queue()
+        self._consumer = None
+
+    async def start(self):
+        # Both command chars notify bidirectionally; subscribe to all of them.
+        for uuid in (UUID_RX, UUID_TX, UUID_FC):
+            try:
+                await self.client.start_notify(uuid, self._on_notify)
+            except Exception:
+                pass
+        # Process every notification through ONE consumer, strictly in arrival order.
+        # Spawning a task per notification races the per-char reassembly buffer when a
+        # multi-fragment response overlaps the previous message's ack.
+        self._consumer = self.loop.create_task(self._consume())
+
+    @staticmethod
+    def _uuid_of(sender) -> str:
+        return str(getattr(sender, "uuid", sender)).lower()
+
+    def _on_notify(self, sender, data: bytearray):
+        # Notify callbacks run in bleak's thread; enqueue, hop to the event loop.
+        uuid = self._uuid_of(sender)
+        self.loop.call_soon_threadsafe(self._queue.put_nowait, (uuid, bytes(data)))
+
+    async def _consume(self):
+        while True:
+            uuid, data = await self._queue.get()
+            try:
+                await self._handle(uuid, data)
+            except Exception as e:  # never let the consumer die
+                self.log(f"  ! transport error: {e}")
+
+    async def _handle(self, uuid: str, data: bytes):
+        if os.environ.get("NOISE_DEBUG"):
+            tag = uuid.replace("16186f", "")[:2] or uuid[-6:]
+            self.log(f"  [dbg char=…{tag}] {data[:24].hex(' ')}{' …' if len(data)>24 else ''}")
+        # Control frame? (first two bytes 00 00)
+        if len(data) >= 6 and data[0] == 0 and data[1] == 0:
+            kind = data[2:4]
+            if kind == b"\x00\x00":                  # ANNOUNCE — peer is about to send on `uuid`
+                count = struct.unpack("<H", data[4:6])[0]
+                self._rx_buf[uuid] = {"count": count, "frags": {}}
+                await self.client.write_gatt_char(uuid, CTRL_READY, response=False)
+            elif kind == b"\x01\x00":                # DONE — peer acked our send; ignore
+                pass
+            # NACK (0x01 0x05) not expected on a clean link.
+            return
+
+        # Data frame: [2-byte LE frag index][payload]
+        if len(data) >= 2 and (data[0] != 0 or data[1] != 0):
+            idx = struct.unpack("<H", data[0:2])[0]
+            st = self._rx_buf.get(uuid)
+            if st is None:                           # single-fragment message (no ANNOUNCE)
+                st = {"count": 1, "frags": {}}
+                self._rx_buf[uuid] = st
+            st["frags"][idx] = data[2:]
+            if len(st["frags"]) >= st["count"]:
+                full = self._reassemble(uuid)
+                await self.client.write_gatt_char(uuid, CTRL_DONE, response=False)
+                # Only the response char delivers application messages.
+                if uuid == UUID_RX:
+                    self._latest = full
+                    self._message_event.set()
+
+    def _reassemble(self, uuid: str) -> bytes:
+        st = self._rx_buf.pop(uuid, None)
+        if not st:
+            return b""
+        out = bytearray()
+        for idx in range(1, st["count"] + 1):
+            out += st["frags"].get(idx, b"")
+        return bytes(out)
+
+    async def send(self, protobuf: bytes):
+        """Frame `protobuf` into fragments and ship it on the command char."""
+        if len(protobuf) <= FRAG_SIZE:
+            frags = [protobuf]
+        else:
+            frags = [protobuf[i:i + FRAG_SIZE] for i in range(0, len(protobuf), FRAG_SIZE)]
+        count = len(frags)
+
+        # ANNOUNCE the fragment count.
+        await self.client.write_gatt_char(UUID_TX, CTRL_ANNOUNCE + struct.pack("<H", count),
+                                          response=False)
+        await asyncio.sleep(0.05)
+        # Push each fragment (10 ms pacing matches the app).
+        for i, frag in enumerate(frags, start=1):
+            await self.client.write_gatt_char(UUID_TX, struct.pack("<H", i) + frag,
+                                              response=False)
+            await asyncio.sleep(0.01)
+
+    async def request(self, protobuf: bytes, timeout: float = 5.0) -> Optional[bytes]:
+        """Send a message and wait for the next reassembled response."""
+        self._latest = None
+        self._message_event.clear()
+        await self.send(protobuf)
+        try:
+            await asyncio.wait_for(self._message_event.wait(), timeout)
+        except asyncio.TimeoutError:
+            self.log("  ! timed out waiting for response")
+            return None
+        return self._latest
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Message builders (SEWear payloads)
+# ─────────────────────────────────────────────────────────────────────────────
+def wear(opcode: int, payload: bytes = b"") -> bytes:
+    return pb_field_varint(1, opcode) + payload
+
+
+def msg_set_time(epoch: int, tz_offset_minutes: int, time_format_24h: Optional[bool] = None) -> bytes:
+    # SEWear{ id=48, system_time(f5)=SESystemTime{ time_set(f1)=SETimeSet{ timestamp, offset, fmt? } } }
+    # The capture sends only timestamp+offset here; the 12/24h format goes in a separate op49.
+    offset_qh = tz_offset_minutes // 15
+    time_set = pb_field_varint(1, epoch) + pb_field_sint32(2, offset_qh)
+    if time_format_24h is not None:
+        time_set += pb_field_varint(3, 1 if time_format_24h else 0)
+    system_time = pb_field_bytes(1, time_set)
+    return wear(OP_SET_TIME, pb_field_bytes(5, system_time))
+
+
+def msg_verify_user(token: str) -> bytes:
+    # SEWear{ id=19, bind_account{ verify_user_number = token } }
+    bind_account = pb_field_bytes(6, token.encode())
+    return wear(OP_VERIFY_USER, pb_field_bytes(3, bind_account))
+
+
+def msg_setime_pb(year, month, day, hour=0, minute=0, second=0) -> bytes:
+    # SETime{ 1=year, 2=month, 3=day, 4=hour, 5=minute, 6=second }
+    return (pb_field_varint(1, year) + pb_field_varint(2, month) + pb_field_varint(3, day)
+            + pb_field_varint(4, hour) + pb_field_varint(5, minute) + pb_field_varint(6, second))
+
+
+def msg_request_fitness(setime: bytes, ftype: int) -> bytes:
+    # SEWear{ id=113, fitness{ fitness_type_id{ time, fitness_function_type } } }
+    type_id = pb_field_bytes(1, setime) + pb_field_varint(2, ftype)
+    fitness = pb_field_bytes(1, type_id)
+    return wear(OP_REQUEST_FITNESS, pb_field_bytes(9, fitness))
+
+
+def msg_confirm_fitness(setime: bytes, ftype: int) -> bytes:
+    type_id = pb_field_bytes(1, setime) + pb_field_varint(2, ftype)
+    fitness = pb_field_bytes(1, type_id)
+    return wear(OP_CONFIRM_FITNESS, pb_field_bytes(9, fitness))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Response decoders
+# ─────────────────────────────────────────────────────────────────────────────
+def decode_status(buf: bytes):
+    """Return the SEErrorCode (field 100) if present, else None."""
+    return pb_get(buf, 100)
+
+
+def decode_device_info(buf: bytes) -> dict:
+    dev = pb_get(buf, 4) or b""          # SEDevice
+    info = pb_get(dev, 1) or b""         # SEDeviceInfo
+    batt = pb_get(info, 5) or b""        # SEDeviceBatteryStatus
     return {
-        "success": success,
-        "cmd_type": data[1],
-        "sub_cmd": data[2],
-        "data": payload,
-        "format": "standard",
-        "raw": data.hex()
+        "firmware": (pb_get(info, 1) or b"").decode(errors="replace"),
+        "model": (pb_get(info, 2) or b"").decode(errors="replace"),
+        "mac": (pb_get(info, 3) or b"").decode(errors="replace"),
+        "serial": (pb_get(info, 4) or b"").decode(errors="replace"),
+        "battery": pb_get(batt, 1),
+        "charging": pb_get(batt, 2),
     }
 
 
-class NoiseFitSyncDaemon:
-    """Full-featured sync daemon for NoiseFit watches."""
-    
-    def __init__(self, mac_address: str):
-        self.mac_address = mac_address
+def decode_battery(buf: bytes):
+    dev = pb_get(buf, 4) or b""
+    status = pb_get(dev, 2) or b""
+    return pb_get(status, 1)
+
+
+def _be_u16_series(data: bytes):
+    return [struct.unpack(">H", data[i:i + 2])[0] for i in range(0, len(data) - 1, 2)]
+
+
+def decode_daily(buf: bytes) -> dict:
+    fitness = pb_get(buf, 9) or b""
+    daily = pb_get(fitness, 4) or b""        # SEDailyData
+    return {
+        "freq_min": pb_get(daily, 2) or 60,
+        "steps": _be_u16_series(pb_get(daily, 3) or b""),
+        "distance_m": _be_u16_series(pb_get(daily, 5) or b""),
+        "calories": _be_u16_series(pb_get(daily, 7) or b""),
+        "today_steps": pb_get(daily, 9),
+    }
+
+
+def decode_hr(buf: bytes) -> dict:
+    fitness = pb_get(buf, 9) or b""
+    hr = pb_get(fitness, 6) or b""           # SEContinuousHeartRateData
+    return {
+        "freq_min": pb_get(hr, 2) or 5,
+        "samples": list(pb_get(hr, 3) or b""),   # u8 BPM, 0 = no reading
+        "max": pb_get(hr, 4),
+        "min": pb_get(hr, 5),
+        "resting": pb_get(hr, 6),
+    }
+
+
+def decode_spo2(buf: bytes) -> dict:
+    fitness = pb_get(buf, 9) or b""
+    spo2 = pb_get(fitness, 8) or b""         # SEContinuousBloodOxygenData
+    return {
+        "freq_min": pb_get(spo2, 2) or 5,
+        "samples": list(pb_get(spo2, 3) or b""),
+        "max": pb_get(spo2, 4),
+        "min": pb_get(spo2, 5),
+    }
+
+
+def decode_offline_measure(buf: bytes, fitness_field: int) -> list:
+    """Decode a list of (epoch, value) spot measurements (SEMeasureData).
+    SpO2 → SEFitness field 9; stress/pressure → field 11."""
+    fitness = pb_get(buf, 9) or b""
+    off = pb_get(fitness, fitness_field) or b""
+    measures = pb_get_all(pb_get(off, 2) or b"", 1)   # SEMeasureData.SEList
+    return [(pb_get(m, 1), pb_get(m, 2)) for m in measures]
+
+
+def decode_sleep(buf: bytes) -> dict:
+    fitness = pb_get(buf, 9) or b""
+    sleep = pb_get(fitness, 5) or b""        # SESleepData
+    stages = []
+    for s in pb_get_all(sleep, 14):          # SESleepDistributionData list
+        stages.append({
+            "start": pb_get(s, 1),
+            "duration": pb_get(s, 2),
+            "type": {0: "awake", 1: "light", 2: "deep", 3: "rem"}.get(pb_get(s, 3), "?"),
+        })
+    return {
+        "start": pb_get(sleep, 2),
+        "end": pb_get(sleep, 3),
+        "duration": pb_get(sleep, 4),
+        "score": pb_get(sleep, 5),
+        "deep_min": pb_get(sleep, 10),
+        "light_min": pb_get(sleep, 8),
+        "awake_min": pb_get(sleep, 6),
+        "stages": stages,
+    }
+
+
+def _series_time_labels(base: datetime.datetime, freq_min: int, count: int):
+    return [base + datetime.timedelta(minutes=i * freq_min) for i in range(count)]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Client
+# ─────────────────────────────────────────────────────────────────────────────
+class NoiseTwist:
+    def __init__(self, mac: str, token: str, log=print):
+        self.mac = mac
+        self.token = token
+        self.log = log
         self.client: Optional[BleakClient] = None
-        self._response_event = asyncio.Event()
-        self._response_buffer = bytearray()
-        self._response_data = bytearray()
-        self._char_uuid_by_handle = {}
-        self._running = False
-        self._last_sync = None
-        self._hr_notify_enabled = False
-        
-        # Stats
-        self.step_count = 0
-        self.last_heart_rate = 0
-        self.battery_level = 0
-        
+        self.transport: Optional[Transport] = None
+        self._type_entries = None       # op112 cache: [(setime_bytes, ftype), ...]
+
     async def connect(self) -> bool:
-        """Connect to the watch."""
-        print(f"→ Connecting to {self.mac_address}...")
-        self.client = BleakClient(self.mac_address)
-        await self.client.connect()
-        
-        if not self.client.is_connected:
-            return False
-        
-        print("✓ Connected")
-        
-        # Populate characteristic handle mapping when the backend exposes services.
-        services = None
-        try:
-            services = self.client.services
-        except AttributeError:
-            services = None
-        if not services and hasattr(self.client, "get_services"):
+        # These watches only accept one connection at a time and need a breather
+        # between sessions, so retry a few times with backoff.
+        last = None
+        for attempt in range(1, 6):
+            self.log(f"→ Connecting to {self.mac} … (attempt {attempt}/5)")
             try:
-                services = await self.client.get_services()
-            except Exception:
-                services = None
-        if services:
-            for service in services:
-                for char in service.characteristics:
-                    handle = getattr(char, "handle", None)
-                    if handle is not None:
-                        self._char_uuid_by_handle[handle] = char.uuid.lower()
-        
-        # Hybrid path for Noise Force:
-        # - ffd1 / ffd8: likely low-level command channels
-        # - 6487: only place we've consistently seen ACK/notify traffic
-        self._write_char_primary = "0000ffd1-0000-1000-8000-00805f9b34fb"
-        self._write_char_secondary = "0000ffd8-0000-1000-8000-00805f9b34fb"
-        self._write_char_fff2 = "0000fff2-0000-1000-8000-00805f9b34fb"
-        self._ack_char = "00006487-3c17-d293-8e48-14fe2e4da212"
-        
-        print(f"  → Primary Write Char (ffd1): {self._write_char_primary}")
-        print(f"  → Secondary Write Char (ffd8): {self._write_char_secondary}")
-        print(f"  → Fixed-len Write Char (fff2): {self._write_char_fff2}")
-        print(f"  → Ack/Notify Char (6487): {self._ack_char}")
-        
-        # Enable notifications where we know they exist
-        await self.client.start_notify(self._ack_char, self._on_notification)
-        try:
-            await self.client.start_notify(CHAR_HR, self._on_notification)
-            self._hr_notify_enabled = True
-        except Exception:
-            pass
-        print("✓ Notifications enabled")
-        
-        return True
-    
-    def _sender_uuid(self, sender) -> Optional[str]:
-        """Best-effort UUID resolution across Bleak backends."""
-        uuid = getattr(sender, "uuid", None)
-        if uuid:
-            return str(uuid).lower()
-        if isinstance(sender, str):
-            return sender.lower()
-        if isinstance(sender, int):
-            return self._char_uuid_by_handle.get(sender)
-        handle = getattr(sender, "handle", None)
-        if handle is not None:
-            return self._char_uuid_by_handle.get(handle)
-        return None
-    
-    def _extract_response_frame(self) -> Optional[bytes]:
-        """Extract a complete response frame from the ACK buffer."""
-        if not self._response_buffer:
-            return None
-        
-        first = self._response_buffer[0]
-        if first in (HEADER, HEADER_LARGE):
-            if len(self._response_buffer) < 6:
-                return None
-            payload_len = self._response_buffer[3] | (self._response_buffer[4] << 8)
-            frame_len = 6 + payload_len
-            if len(self._response_buffer) < frame_len:
-                return None
-            frame = bytes(self._response_buffer[:frame_len])
-            if frame[-1] != TRAILER:
-                # Resync on malformed frames instead of blocking future responses.
-                del self._response_buffer[:1]
-                return None
-            del self._response_buffer[:frame_len]
-            return frame
-        
-        for idx, value in enumerate(self._response_buffer):
-            if value in (HEADER, HEADER_LARGE):
-                del self._response_buffer[:idx]
-                return None
-        
-        if len(self._response_buffer) >= 3:
-            frame = bytes(self._response_buffer[:3])
-            del self._response_buffer[:3]
-            return frame
-        
-        return None
-    
-    def _on_notification(self, sender, data: bytearray):
-        """Handle incoming data."""
-        sender_uuid = self._sender_uuid(sender)
-        
-        # Parse heart rate if from HR characteristic
-        if sender_uuid and "2a37" in sender_uuid:
-            hr = self._parse_hr_data(bytes(data))
-            if hr:
-                self.last_heart_rate = hr
-                print(f"♥ Heart Rate: {hr} BPM")
-            return
-        
-        if sender_uuid == self._ack_char.lower():
-            self._response_buffer.extend(data)
-            if not self._response_event.is_set():
-                frame = self._extract_response_frame()
-                if frame is not None:
-                    self._response_data.clear()
-                    self._response_data.extend(frame)
-                    self._response_event.set()
-    
-    def _parse_hr_data(self, data: bytes) -> Optional[int]:
-        """Parse heart rate from BLE HR characteristic data."""
-        if len(data) < 2:
-            return None
-        # HR format: flags (1 byte) + HR value
-        flags = data[0]
-        if flags & 0x01:  # 16-bit HR
-            return struct.unpack('<H', data[1:3])[0] if len(data) >= 3 else None
-        else:  # 8-bit HR
-            return data[1]
-    
-    async def send_cmd(self, cmd_type: int, sub_cmd: int, data: bytes = b"", timeout: float = 5.0) -> dict:
-        """Send command and wait for response.
-        
-        Hybrid strategy:
-        1. send on ffd1 (primary low-level channel)
-        2. mirror on ffd8 (secondary low-level channel)
-        3. send on 6487 to trigger observable ACK path
-        """
-        packet = build_packet(cmd_type, sub_cmd, data)
-        print(f"  TX: {packet.hex()}")
-        
-        self._response_buffer.clear()
-        self._response_data.clear()
-        self._response_event.clear()
-        
-        # Low-level channels first
-        try:
-            await self.client.write_gatt_char(self._write_char_primary, packet, response=False)
-        except Exception as e:
-            print(f"  ⚠ ffd1 write failed: {e}")
-        
-        try:
-            await self.client.write_gatt_char(self._write_char_secondary, packet, response=False)
-        except Exception:
-            pass
-        
-        # ACK/bridge channel last
-        try:
-            await self.client.write_gatt_char(self._ack_char, packet, response=True)
-        except Exception as e:
-            print(f"  ⚠ 6487 write failed: {e}")
-        
-        try:
-            await asyncio.wait_for(self._response_event.wait(), timeout)
-            response = bytes(self._response_data)
-            print(f"  RX: {response.hex()}")
-            return parse_response(response)
-        except asyncio.TimeoutError:
-            return {"success": False, "error": "Timeout", "packet": packet.hex()}
-    
-    async def bind_start(self) -> dict:
-        return await self.send_cmd(CMD_BIND_START, SUB_SET)
-    
-    async def bind_end(self) -> dict:
-        return await self.send_cmd(CMD_BIND_END, SUB_SET)
-    
-    async def _write_raw_candidate(self, label: str, char_uuid: str, payload: bytes, response: bool, timeout: float = 1.5) -> dict:
-        """Write a raw payload to a specific characteristic and optionally wait for ACK on 6487."""
-        print(f"\n  Trying raw path: {label}")
-        try:
-            printable = payload.hex()
-        except Exception:
-            printable = str(payload)
-        print(f"  Payload: {printable}")
-        
-        self._response_buffer.clear()
-        self._response_data.clear()
-        self._response_event.clear()
-        
-        try:
-            await self.client.write_gatt_char(char_uuid, payload, response=response)
-        except Exception as e:
-            print(f"  ✗ Write failed: {e}")
-            return {"success": False, "error": str(e), "payload": printable, "char": char_uuid}
-        
-        try:
-            await asyncio.wait_for(self._response_event.wait(), timeout)
-            response_data = bytes(self._response_data)
-            print(f"  RX: {response_data.hex()}")
-            return parse_response(response_data)
-        except asyncio.TimeoutError:
-            print("  (no ACK)")
-            return {
-                "success": False,
-                "acknowledged": False,
-                "sent": True,
-                "note": "write sent, no ack",
-                "payload": printable,
-                "char": char_uuid,
-            }
-    
-    async def _write_chunked(self, label: str, char_uuid: str, payload: bytes, chunk_size: int = 20, response: bool = False, gap: float = 0.05):
-        """Write a long payload in BLE-sized chunks."""
-        print(f"\n  Trying chunked path: {label}")
-        print(f"  Total bytes: {len(payload)}")
-        self._response_buffer.clear()
-        self._response_data.clear()
-        self._response_event.clear()
-        for i in range(0, len(payload), chunk_size):
-            chunk = payload[i:i+chunk_size]
-            print(f"    chunk[{i//chunk_size}]: {chunk.hex()}")
-            await self.client.write_gatt_char(char_uuid, chunk, response=response)
-            await asyncio.sleep(gap)
-        try:
-            await asyncio.wait_for(self._response_event.wait(), 1.5)
-            response_data = bytes(self._response_data)
-            print(f"  RX: {response_data.hex()}")
-            return parse_response(response_data)
-        except asyncio.TimeoutError:
-            print("  (no ACK)")
-            return {"success": False, "acknowledged": False, "sent": True, "note": "chunked write sent, no ack"}
-    
-    async def sync_time(self, debug: bool = True) -> dict:
-        """Sync watch time using packet and raw legacy probes."""
-        now = datetime.now()
-        yy2000 = now.year - 2000
-        yy2010 = now.year - 2010
-        yy1900 = now.year - 1900
-        weekday = now.isoweekday()  # 1..7
-        epoch = int(now.timestamp())
-        
-        def bcd(v: int) -> int:
-            return ((v // 10) << 4) | (v % 10)
-        
-        print(f"→ Syncing time: {now.strftime('%Y-%m-%d %H:%M:%S')}")
-        print("  Watch currently shows: 2021-06-06 10:18 (WRONG)")
-        
-        # Stage 1: packet-wrapped formats
-        packet_successes = 0
-        raw_successes = 0
-        json_successes = 0
-        packet_formats = [
-            ("Year-2000 (packet)", struct.pack('6B', yy2000, now.month, now.day, now.hour, now.minute, now.second)),
-            ("Year-2010 (packet)", struct.pack('6B', yy2010, now.month, now.day, now.hour, now.minute, now.second)),
-            ("Year-1900 (packet)", struct.pack('6B', yy1900, now.month, now.day, now.hour, now.minute, now.second)),
-            ("Full year LE (packet)", struct.pack('<H5B', now.year, now.month, now.day, now.hour, now.minute, now.second)),
-            ("Reversed (packet)", struct.pack('6B', now.second, now.minute, now.hour, now.day, now.month, yy2000)),
-        ]
-        
-        for name, data in packet_formats:
-            print(f"\n  Trying format: {name}")
-            print(f"  Data: {data.hex()}")
-            result = await self.send_cmd(CMD_TIME, SUB_SET, data)
-            if result.get("success"):
-                packet_successes += 1
-            print(f"  Response: {result}")
-        
-        # Stage 2: raw writes to legacy channels
-        raw_payloads = [
-            ("raw6 y-m-d h:m:s (2000)", struct.pack('6B', yy2000, now.month, now.day, now.hour, now.minute, now.second)),
-            ("raw6 y-m-d h:m:s (2010)", struct.pack('6B', yy2010, now.month, now.day, now.hour, now.minute, now.second)),
-            ("raw7 y-m-d h:m:s weekday", struct.pack('7B', yy2000, now.month, now.day, now.hour, now.minute, now.second, weekday)),
-            ("raw7 full-year LE", struct.pack('<H5B', now.year, now.month, now.day, now.hour, now.minute, now.second)),
-            ("raw4 epoch32 LE", struct.pack('<I', epoch)),
-            ("raw4 epoch32 BE", struct.pack('>I', epoch)),
-            ("raw8 epoch64 LE", struct.pack('<Q', epoch)),
-            ("raw6 BCD", bytes([bcd(yy2000), bcd(now.month), bcd(now.day), bcd(now.hour), bcd(now.minute), bcd(now.second)])),
-        ]
-        
-        raw_paths = [
-            ("ffd1", self._write_char_primary, False),
-            ("ffd8", self._write_char_secondary, False),
-            ("fff2", self._write_char_fff2, True),
-        ]
-        
-        for payload_name, payload in raw_payloads:
-            for path_name, char_uuid, response in raw_paths:
-                result = await self._write_raw_candidate(f"{path_name} / {payload_name}", char_uuid, payload, response)
-                if result.get("success"):
-                    raw_successes += 1
-                if not debug:
-                    await asyncio.sleep(0.3)
-        
-        # Stage 3: IDO-style JSON time writes (found in decompiled app)
-        tz_hours = int(datetime.now().astimezone().utcoffset().total_seconds() // 3600)
-        json_obj = {
-            "year": now.year,
-            "monuth": now.month,
-            "day": now.day,
-            "hour": now.hour,
-            "minute": now.minute,
-            "second": now.second,
-            "week": weekday,
-            "time_zone": tz_hours,
-        }
-        json_bytes = json.dumps(json_obj, separators=(",", ":")).encode("utf-8")
-        print(f"\n  IDO JSON candidate: {json_bytes.decode('utf-8')}")
-        
-        # likely command id from decompiled app: 0x68
-        json_packet_candidates = [
-            ("packet cmd=0x68 sub=0x71 + json", build_packet(0x68, 0x71, json_bytes)),
-            ("packet cmd=0x68 sub=0x70 + json", build_packet(0x68, 0x70, json_bytes)),
-            ("raw prefix 0x68 + json", bytes([0x68]) + json_bytes),
-            ("raw prefix 0x68 0x00 + json", bytes([0x68, 0x00]) + json_bytes),
-            ("raw json only", json_bytes),
-        ]
-        
-        for label, payload in json_packet_candidates:
-            result = await self._write_raw_candidate(f"6487 / {label}", self._ack_char, payload, True)
-            if result.get("success"):
-                json_successes += 1
-            result = await self._write_raw_candidate(f"ffd1 / {label}", self._write_char_primary, payload, False)
-            if result.get("success"):
-                json_successes += 1
-            result = await self._write_raw_candidate(f"ffd8 / {label}", self._write_char_secondary, payload, False)
-            if result.get("success"):
-                json_successes += 1
-        
-        # fff2 rejects variable lengths, so try 20-byte chunked JSON there
-        try:
-            result = await self._write_chunked("fff2 / raw json chunked", self._write_char_fff2, json_bytes, chunk_size=20, response=True)
-            if result.get("success"):
-                json_successes += 1
-        except Exception as e:
-            print(f"  fff2 chunked failed: {e}")
-        
-        success = (packet_successes + raw_successes + json_successes) > 0
-        if success:
-            self._last_sync = now
-        return {
-            "success": success,
-            "tried_packet": len(packet_formats),
-            "tried_raw": len(raw_payloads) * len(raw_paths),
-            "tried_json": len(json_packet_candidates),
-            "packet_successes": packet_successes,
-            "raw_successes": raw_successes,
-            "json_successes": json_successes,
-        }
-    
-    async def read_battery(self) -> dict:
-        """Read battery level."""
-        try:
-            data = await self.client.read_gatt_char(CHAR_BATTERY)
-            level = data[0] if data else 0
-            self.battery_level = level
-            return {"success": True, "level": level}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
-    
-    async def enable_hr_monitoring(self):
-        """Enable real-time heart rate notifications."""
-        print("→ Enabling heart rate monitoring...")
-        
-        # First, write to HR control characteristic to start measurement
-        try:
-            # 0x2a39 is HR control point - write 0x01 to start continuous measurement
-            await self.client.write_gatt_char("00002a39-0000-1000-8000-00805f9b34fb", b'\x01')
-        except Exception:
-            pass
-        
-        # Enable notifications on HR measurement characteristic once
-        if not self._hr_notify_enabled:
-            try:
-                await self.client.start_notify(CHAR_HR, self._on_notification)
-                self._hr_notify_enabled = True
-            except Exception as e:
-                if "already started" not in str(e).lower():
-                    raise
-                self._hr_notify_enabled = True
-        print("✓ Heart rate monitoring enabled")
-    
-    async def read_steps(self) -> dict:
-        """Read step count - try to query from custom service."""
-        # This might need a specific command for your watch
-        # Try sending a data sync request
-        print("→ Reading step count...")
-        
-        # Format: [command, sub] - requesting sport data
-        # This is guesswork based on AppsComm protocol
-        result = await self.send_cmd(0x52, 0x70, b'\x01')  # 0x52 = data sync, 0x70 = get, 0x01 = sport
-        
-        if result.get("success") and len(result.get("data", [])) > 0:
-            # Try to parse step data from response
-            data = result["data"]
-            if len(data) >= 4:
-                steps = struct.unpack('<I', data[:4])[0]
-                self.step_count = steps
-                return {"success": True, "steps": steps}
-        
-        return {"success": False, "result": result}
-    
-    async def send_notification(self, notif_type: int, title: str, message: str):
-        """Send notification to watch."""
-        print(f"→ Sending notification: {title}")
-        
-        # Pack notification: [type, title_len, msg_len, title..., msg...]
-        title_bytes = title.encode('utf-8')[:20]  # Limit length
-        msg_bytes = message.encode('utf-8')[:50]
-        
-        data = struct.pack('BBB', notif_type, len(title_bytes), len(msg_bytes))
-        data += title_bytes + msg_bytes
-        
-        # Use message push command (0x05 for notify category)
-        result = await self.send_cmd(0x05, 0x71, data)
-        return result
-    
-    async def find_phone(self) -> dict:
-        """Trigger find phone (makes watch vibrate/beep)."""
-        print("→ Sending find phone command (should vibrate)...")
-        # CONTROL_DEVICE_FIND_PHONE_SUCCESS = 0x10
-        result = await self.send_cmd(0x51, SUB_SET, struct.pack('B', 0x10))
-        return result
-    
-    async def find_phone_alert(self) -> dict:
-        """Trigger continuous find phone alert."""
-        print("→ Triggering find phone alert (vibrate + beep)...")
-        # Try the find phone command which should make it vibrate
-        for i in range(3):
-            result = await self.send_cmd(0x51, SUB_SET, struct.pack('B', 0x10))
-            await asyncio.sleep(0.5)
-        return result
-    
-    async def vibrate(self, pattern: int = 1):
-        """Make watch vibrate - uses find phone command."""
-        print("→ Sending vibrate command...")
-        # For this watch, use find phone command (0x10) which triggers vibration
-        result = await self.send_cmd(0x51, SUB_SET, struct.pack('B', 0x10))
-        return result
-    
-    async def read_current_time(self) -> dict:
-        """Try to read current watch time."""
-        print("→ Reading current watch time...")
-        result = await self.send_cmd(CMD_TIME, SUB_GET)
-        
-        if result.get("success") and len(result.get("data", [])) > 0:
-            data = result["data"]
-            print(f"  Raw time data: {data.hex()}")
-            
-            # Try to parse in different formats
-            if len(data) >= 6:
-                # Format: [YY, MM, DD, HH, mm, ss]
-                yy, mm, dd, hh, minute, ss = struct.unpack('6B', data[:6])
-                print(f"  Parsed as Year-2000: 20{yy:02d}-{mm:02d}-{dd:02d} {hh:02d}:{minute:02d}:{ss:02d}")
-                
-                # Try Year-2010
-                if yy < 20:
-                    real_year = 2010 + yy
-                    print(f"  If Year-2010: {real_year}-{mm:02d}-{dd:02d} {hh:02d}:{minute:02d}:{ss:02d}")
-        
-        return result
-    
-    async def run_sync_cycle(self):
-        """Run one full sync cycle."""
-        print(f"\n{'='*50}")
-        print(f"SYNC CYCLE - {datetime.now().strftime('%H:%M:%S')}")
-        print(f"{'='*50}")
-        
-        # Sync time
-        time_sync = await self.sync_time()
-        if time_sync.get("success"):
-            print(f"  Time sync acknowledged ({time_sync['packet_successes'] + time_sync['raw_successes'] + time_sync['json_successes']} successful response(s))")
-        else:
-            print("  Time sync: no acknowledged response")
-        
-        # Read battery
-        battery = await self.read_battery()
-        print(f"  Battery: {battery.get('level', '?')}%")
-        
-        # Read steps
-        steps = await self.read_steps()
-        if steps.get("success"):
-            print(f"  Steps: {steps.get('steps', 0)}")
-        
-        # Enable HR if not already
-        if self.last_heart_rate == 0:
-            await self.enable_hr_monitoring()
-        
-        print(f"  Last HR: {self.last_heart_rate} BPM")
-        
-        self._last_sync = datetime.now()
-        print(f"✓ Sync complete")
-    
-    async def run_daemon(self):
-        """Main daemon loop - syncs every 30 minutes."""
-        print("\n" + "="*50)
-        print("NOISEFIT SYNC DAEMON STARTED")
-        print("="*50)
-        print(f"Watch: {self.mac_address}")
-        print(f"Sync interval: 30 minutes")
-        print(f"Press Ctrl+C to stop\n")
-        
-        # Initial connection and sync
-        if not await self.connect():
-            print("❌ Failed to connect")
-            return
-        
-        await self.bind_start()
-        await self.run_sync_cycle()
-        await self.bind_end()
-        
-        self._running = True
-        
-        try:
-            while self._running:
-                # Sleep until next sync (30 minutes)
-                await asyncio.sleep(30 * 60)
-                
-                # Run sync cycle
-                await self.bind_start()
-                await self.run_sync_cycle()
-                await self.bind_end()
-                
-        except asyncio.CancelledError:
-            print("\nStopping daemon...")
-        finally:
-            await self.disconnect()
-    
-    async def interactive_mode(self):
-        """Interactive mode for testing."""
-        if not await self.connect():
-            print("❌ Failed to connect")
-            return
-        
-        await self.bind_start()
-        await self.run_sync_cycle()
-        
-        print("\n" + "="*50)
-        print("INTERACTIVE MODE")
-        print("Commands: time, readtime, hr, steps, battery, vibrate, findphone, notify, sync, quit")
-        print("="*50)
-        
-        while True:
-            try:
-                cmd = input("\n> ").strip().lower()
-                
-                if cmd == "quit" or cmd == "q":
+                self.client = BleakClient(self.mac, timeout=15.0)
+                await self.client.connect()
+                if self.client.is_connected:
                     break
-                elif cmd == "time":
-                    await self.sync_time(debug=True)
-                elif cmd == "readtime":
-                    await self.read_current_time()
-                elif cmd == "hr":
-                    await self.enable_hr_monitoring()
-                    await asyncio.sleep(5)
-                    print(f"Current HR: {self.last_heart_rate}")
-                elif cmd == "steps":
-                    result = await self.read_steps()
-                    print(f"Steps: {result}")
-                elif cmd == "battery":
-                    result = await self.read_battery()
-                    print(f"Battery: {result}")
-                elif cmd == "vibrate":
-                    await self.vibrate()
-                elif cmd == "findphone":
-                    await self.find_phone_alert()
-                elif cmd == "notify":
-                    title = input("Title: ")
-                    message = input("Message: ")
-                    await self.send_notification(MSG_SMS, title, message)
-                elif cmd == "sync":
-                    await self.run_sync_cycle()
-                else:
-                    print("Unknown command")
-                    
             except Exception as e:
-                print(f"Error: {e}")
-        
-        await self.bind_end()
-        await self.disconnect()
-    
+                last = e
+            await asyncio.sleep(2.0 * attempt)
+        else:
+            self.log(f"  ! connect failed: {last}")
+            return False
+        self.log("✓ Connected")
+        try:
+            await self.client.exchange_mtu(247)
+        except Exception:
+            pass
+        self.transport = Transport(self.client, asyncio.get_event_loop(), self.log)
+        await self.transport.start()
+        return True
+
     async def disconnect(self):
-        """Disconnect."""
-        if self.client:
+        if self.client and self.client.is_connected:
             await self.client.disconnect()
-            print("✓ Disconnected")
+
+    async def bring_up(self) -> bool:
+        self.log("→ Session bring-up …")
+        # op0 connect parameter (phone_type ANDROID=0)
+        await self.transport.send(wear(OP_CONNECT_PARAM, pb_field_bytes(99, pb_field_varint(4, 0))))
+        await asyncio.sleep(0.1)
+        # op16 inquiry binding status
+        await self.transport.send(wear(OP_INQUIRY_BINDING))
+        await asyncio.sleep(0.15)
+        # op19 verify user number — the auth gate
+        self.log(f"→ VERIFY_USER_NUMBER token={self.token} …")
+        resp = await self.transport.request(msg_verify_user(self.token))
+        if resp is None:
+            self.log("  ! no verify response")
+            return False
+        bind = pb_get(resp, 3) or b""
+        vresult = pb_get(bind, 7) or b""      # SEVerifyResult
+        if pb_get(vresult, 1) != 1:
+            self.log("  ! token rejected — watch may be unbound or token expired")
+            return False
+        self.log("✓ Authenticated")
+        return True
+
+    async def sync_time(self) -> bool:
+        now = datetime.datetime.now().astimezone()
+        epoch = int(now.timestamp())
+        offset_min = int(now.utcoffset().total_seconds() // 60)   # signed east-of-UTC minutes
+        self.log(f"→ SET_SYSTEM_TIME  epoch={epoch}  ({now.isoformat()})  tz={offset_min}min")
+        resp = await self.transport.request(msg_set_time(epoch, offset_min))
+        status = decode_status(resp) if resp else None
+        ok = status == 0
+        self.log("✓ Time set" if ok else f"! time set status={status}")
+        return ok
+
+    async def get_info(self) -> Optional[dict]:
+        resp = await self.transport.request(wear(OP_GET_DEVICE_INFO))
+        if not resp:
+            return None
+        info = decode_device_info(resp)
+        self.log(f"  firmware : {info['firmware']}")
+        self.log(f"  model    : {info['model']}")
+        self.log(f"  mac      : {info['mac']}")
+        self.log(f"  serial   : {info['serial']}")
+        self.log(f"  battery  : {info['battery']}%")
+        return info
+
+    async def get_battery(self):
+        resp = await self.transport.request(wear(OP_GET_BATTERY))
+        if not resp:
+            return None
+        level = decode_battery(resp)
+        self.log(f"  battery  : {level}%")
+        return level
+
+    async def _fitness_entries(self):
+        """op112 → list of (setime_bytes, ftype). Cached per session.
+        Continuous types are keyed to 00:00; spot measurements (SpO2, stress) are
+        keyed to the exact time they were taken — that time must be replayed in op113."""
+        if self._type_entries is None:
+            r = await self.transport.request(wear(OP_GET_FITNESS_TYPES), timeout=5)
+            fitness = pb_get(r, 9) or b""
+            self._type_entries = [
+                (pb_get(e, 1) or b"", pb_get(e, 2))
+                for e in pb_get_all(pb_get(fitness, 2) or b"", 1)
+            ]
+        return self._type_entries
+
+    def _setime_for(self, ftype: int, entries) -> bytes:
+        """Exact SETime for a type from the op112 directory, or today-00:00 fallback."""
+        for setime, f in entries:
+            if f == ftype:
+                return setime
+        base = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        return msg_setime_pb(base.year, base.month, base.day)
+
+    async def _pull_fitness(self, ftype: int, decoder, label: str):
+        entries = await self._fitness_entries()
+        setime = self._setime_for(ftype, entries)
+        self.log(f"→ REQUEST_FITNESS type={label}")
+        resp = await self.transport.request(msg_request_fitness(setime, ftype), timeout=8.0)
+        if not resp:
+            self.log("  ! no data")
+            return None
+        decoded = decoder(resp)
+        # Confirm + await the ack so each exchange is fully serialized before the next
+        # request (the watch won't stream a 2nd type until the 1st is confirmed).
+        await self.transport.request(msg_confirm_fitness(setime, ftype), timeout=3.0)
+        return decoded
+
+    async def pull_steps(self):
+        d = await self._pull_fitness(FT_DAILY, decode_daily, "DAILY (steps)")
+        if not d:
+            return
+        base = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        labels = _series_time_labels(base, d["freq_min"], len(d["steps"]))
+        self.log(f"  steps today : {sum(d['steps'])}  ({len(d['steps'])} hourly buckets)")
+        for t, s, dist, cal in zip(labels, d["steps"], d["distance_m"], d["calories"]):
+            if s:
+                self.log(f"    {t:%H:%M}  {s:>5} steps  {dist:>4} m  {cal} kcal")
+
+    async def pull_hr(self):
+        d = await self._pull_fitness(FT_HR, decode_hr, "HEART_RATE")
+        if not d:
+            return
+        base = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        labels = _series_time_labels(base, d["freq_min"], len(d["samples"]))
+        nz = [(t, v) for t, v in zip(labels, d["samples"]) if v]
+        self.log(f"  HR samples  : {len(nz)}  range {d['min']}–{d['max']} bpm  (resting {d['resting']})")
+        for t, v in nz[:12]:
+            self.log(f"    {t:%H:%M}  {v} bpm")
+        if len(nz) > 12:
+            self.log(f"    … (+{len(nz)-12} more)")
+
+    async def pull_sleep(self):
+        d = await self._pull_fitness(FT_SLEEP, decode_sleep, "SLEEP")
+        if not d:
+            return
+        if not d.get("start"):
+            self.log("  (no sleep data for today)")
+            return
+        self.log(f"  sleep {d['start']} → {d['end']}  score {d['score']}  "
+                 f"deep {d['deep_min']}min light {d['light_min']}min")
+        for st in d["stages"]:
+            self.log(f"    stage {st['type']:6s} @ {st['start']}  {st['duration']}min")
+
+    async def pull_spo2(self):
+        """Spot SpO2 measurements (offline type 5)."""
+        ms = await self._pull_fitness(FT_SPO2,
+                                      lambda b: decode_offline_measure(b, OFFLINE_FITNESS_FIELD[FT_SPO2]),
+                                      "SpO2")
+        if ms is None:
+            return                       # transport already logged "no data"
+        if not ms:
+            self.log("  (no SpO2 measurements today)")
+            return
+        self.log(f"  SpO2 measurements: {len(ms)}")
+        for ts, val in ms:
+            when = datetime.datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else "?"
+            self.log(f"    {when}  ->  {val}%")
+
+    async def pull_stress(self):
+        """Spot stress/pressure measurements (offline type 7)."""
+        ms = await self._pull_fitness(FT_STRESS,
+                                      lambda b: decode_offline_measure(b, OFFLINE_FITNESS_FIELD[FT_STRESS]),
+                                      "STRESS")
+        if not ms:
+            self.log("  (no stress measurements today)")
+            return
+        self.log(f"  Stress measurements: {len(ms)}")
+        for ts, val in ms:
+            when = datetime.datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else "?"
+            level = ("relaxed" if val < 40 else "normal" if val < 60 else "tense" if val < 80 else "stressed")
+            self.log(f"    {when}  ->  {val}  ({level})")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
 async def main():
-    """Main entry point."""
-    mac = None
-    daemon_mode = False
-    
-    for arg in sys.argv[1:]:
-        if arg in ("--daemon", "-d"):
-            daemon_mode = True
-        elif ':' in arg or '-' in arg:
-            mac = arg
-    
-    if not mac:
-        print("Usage: uv run noise_sync.py <MAC_ADDRESS> [--daemon]")
-        print(f"\nYour Force watch MAC: 2DE08656-A97F-79F8-94B1-7CF03FE26FE0")
-        return
-    
-    daemon = NoiseFitSyncDaemon(mac)
-    
-    if daemon_mode:
-        await daemon.run_daemon()
-    else:
-        await daemon.interactive_mode()
+    ap = argparse.ArgumentParser(description="NoiseFit Twist sync client")
+    ap.add_argument("mac", help="watch BLE MAC address")
+    ap.add_argument("--token", default=DEFAULT_TOKEN, help="verify-user-number token")
+    ap.add_argument("--time", action="store_true", help="sync time")
+    ap.add_argument("--info", action="store_true", help="read device info")
+    ap.add_argument("--battery", action="store_true", help="read battery")
+    ap.add_argument("--steps", action="store_true", help="pull step series")
+    ap.add_argument("--hr", action="store_true", help="pull heart-rate series")
+    ap.add_argument("--sleep", action="store_true", help="pull sleep data")
+    ap.add_argument("--spo2", action="store_true", help="pull SpO2 measurements")
+    ap.add_argument("--stress", action="store_true", help="pull stress measurements")
+    ap.add_argument("--all", action="store_true", help="time + info + all health")
+    args = ap.parse_args()
+
+    if args.all:
+        args.time = args.info = args.steps = args.hr = args.sleep = args.spo2 = args.stress = True
+    if not any([args.time, args.info, args.battery, args.steps, args.hr,
+                args.sleep, args.spo2, args.stress]):
+        args.info = True
+
+    watch = NoiseTwist(args.mac, args.token)
+    try:
+        if not await watch.connect():
+            sys.exit("connection failed")
+        if not await watch.bring_up():
+            sys.exit("authentication failed (bad token? watch unbound?)")
+
+        if args.time:
+            await watch.sync_time()
+        if args.info:
+            await watch.get_info()
+        if args.battery:
+            await watch.get_battery()
+        if args.steps:
+            await watch.pull_steps()
+        if args.hr:
+            await watch.pull_hr()
+        if args.sleep:
+            await watch.pull_sleep()
+        if args.spo2:
+            await watch.pull_spo2()
+        if args.stress:
+            await watch.pull_stress()
+    finally:
+        await watch.disconnect()
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\nExited")
+    asyncio.run(main())
