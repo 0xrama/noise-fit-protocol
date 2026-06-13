@@ -36,10 +36,24 @@ import sys
 from typing import Optional
 
 try:
-    from bleak import BleakClient
+    from bleak import BleakClient, BleakScanner
 except ImportError:
     print("ERROR: bleak is not installed.  pip install bleak", file=sys.stderr)
     sys.exit(1)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -434,28 +448,40 @@ def _series_time_labels(base: datetime.datetime, freq_min: int, count: int):
 # Client
 # ─────────────────────────────────────────────────────────────────────────────
 class NoiseTwist:
-    def __init__(self, mac: str, token: str, log=print):
+    def __init__(self, mac: str, token: str, log=print, *, ble_device=None,
+                 connect_timeout: Optional[float] = None,
+                 connect_attempts: Optional[int] = None):
         self.mac = mac
         self.token = token
         self.log = log
         self.client: Optional[BleakClient] = None
         self.transport: Optional[Transport] = None
+        self._ble_target = ble_device or mac
+        self._connect_timeout = connect_timeout or _env_float("NOISE_CONNECT_TIMEOUT", 8.0)
+        self._connect_attempts = max(1, connect_attempts or _env_int("NOISE_CONNECT_ATTEMPTS", 2))
+        self._fitness_timeout = _env_float("NOISE_FITNESS_TIMEOUT", 6.0)
         self._type_entries = None       # op112 cache: [(setime_bytes, ftype), ...]
 
     async def connect(self) -> bool:
-        # These watches only accept one connection at a time and need a breather
-        # between sessions, so retry a few times with backoff.
+        # Prefer a BLEDevice from scan(); connecting by raw address can trigger
+        # another slow discovery pass in bleak, especially on macOS.
         last = None
-        for attempt in range(1, 6):
-            self.log(f"→ Connecting to {self.mac} … (attempt {attempt}/5)")
+        for attempt in range(1, self._connect_attempts + 1):
+            self.log(f"→ Connecting to {self.mac} … (attempt {attempt}/{self._connect_attempts})")
             try:
-                self.client = BleakClient(self.mac, timeout=15.0)
+                self.client = BleakClient(self._ble_target, timeout=self._connect_timeout)
                 await self.client.connect()
                 if self.client.is_connected:
                     break
             except Exception as e:
                 last = e
-            await asyncio.sleep(2.0 * attempt)
+                try:
+                    if self.client:
+                        await self.client.disconnect()
+                except Exception:
+                    pass
+            if attempt < self._connect_attempts:
+                await asyncio.sleep(min(1.5, 0.5 * attempt))
         else:
             self.log(f"  ! connect failed: {last}")
             return False
@@ -473,6 +499,12 @@ class NoiseTwist:
             await self.client.disconnect()
 
     async def bring_up(self) -> bool:
+        return await self.bring_up_ex() == "ok"
+
+    async def bring_up_ex(self) -> str:
+        """Session bring-up. Returns "ok", "timeout" (no verify response — often a
+        held/half-open link), or "rejected" (token genuinely refused). The two
+        failure modes need different handling, so they're reported distinctly."""
         self.log("→ Session bring-up …")
         # op0 connect parameter (phone_type ANDROID=0)
         await self.transport.send(wear(OP_CONNECT_PARAM, pb_field_bytes(99, pb_field_varint(4, 0))))
@@ -484,15 +516,15 @@ class NoiseTwist:
         self.log(f"→ VERIFY_USER_NUMBER token={self.token} …")
         resp = await self.transport.request(msg_verify_user(self.token))
         if resp is None:
-            self.log("  ! no verify response")
-            return False
+            self.log("  ! no verify response (watch busy or link half-open)")
+            return "timeout"
         bind = pb_get(resp, 3) or b""
         vresult = pb_get(bind, 7) or b""      # SEVerifyResult
         if pb_get(vresult, 1) != 1:
             self.log("  ! token rejected — watch may be unbound or token expired")
-            return False
+            return "rejected"
         self.log("✓ Authenticated")
-        return True
+        return "ok"
 
     async def sync_time(self) -> bool:
         now = datetime.datetime.now().astimezone()
@@ -530,7 +562,10 @@ class NoiseTwist:
         Continuous types are keyed to 00:00; spot measurements (SpO2, stress) are
         keyed to the exact time they were taken — that time must be replayed in op113."""
         if self._type_entries is None:
-            r = await self.transport.request(wear(OP_GET_FITNESS_TYPES), timeout=5)
+            r = await self.transport.request(wear(OP_GET_FITNESS_TYPES), timeout=3)
+            if not r:
+                self._type_entries = []
+                return self._type_entries
             fitness = pb_get(r, 9) or b""
             self._type_entries = [
                 (pb_get(e, 1) or b"", pb_get(e, 2))
@@ -538,19 +573,24 @@ class NoiseTwist:
             ]
         return self._type_entries
 
-    def _setime_for(self, ftype: int, entries) -> bytes:
-        """Exact SETime for a type from the op112 directory, or today-00:00 fallback."""
+    def _setime_for(self, ftype: int, entries) -> Optional[bytes]:
+        """Exact SETime for a type from the op112 directory, or optional today fallback."""
         for setime, f in entries:
             if f == ftype:
                 return setime
-        base = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        return msg_setime_pb(base.year, base.month, base.day)
+        if os.environ.get("NOISE_FITNESS_FALLBACK"):
+            base = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            return msg_setime_pb(base.year, base.month, base.day)
+        return None
 
     async def _pull_fitness(self, ftype: int, decoder, label: str):
         entries = await self._fitness_entries()
         setime = self._setime_for(ftype, entries)
+        if setime is None:
+            self.log(f"→ REQUEST_FITNESS type={label} skipped (not advertised)")
+            return None
         self.log(f"→ REQUEST_FITNESS type={label}")
-        resp = await self.transport.request(msg_request_fitness(setime, ftype), timeout=8.0)
+        resp = await self.transport.request(msg_request_fitness(setime, ftype), timeout=self._fitness_timeout)
         if not resp:
             self.log("  ! no data")
             return None
@@ -626,13 +666,115 @@ class NoiseTwist:
             self.log(f"    {when}  ->  {val}  ({level})")
 
 
+async def scan_watches(timeout: float = 6.0, log=print, early_exit: bool = True):
+    """Scan for NoiseFit watches and return a list of BLEDevice objects.
+
+    On macOS, CoreBluetooth never exposes the real BLE MAC — devices are keyed
+    by an opaque per-host UUID instead — so we identify the watch by its name
+    ("NoiseFit …") or by advertising the custom service UUID, NOT by MAC. When
+    `early_exit` is set we stop the instant a watch appears, which is what makes
+    the connect fast instead of waiting out the whole window.
+    """
+    found = {}          # address -> BLEDevice
+    seen_adv = {}       # address -> (name, rssi)
+
+    def _is_watch(name, adv) -> bool:
+        if name and "noise" in name.lower():
+            return True
+        uuids = [u.lower() for u in (adv.service_uuids or [])]
+        return UUID_SERVICE.lower() in uuids
+
+    def _cb(device, adv):
+        name = device.name or adv.local_name or ""
+        if _is_watch(name, adv):
+            found[device.address] = device
+            seen_adv[device.address] = (name or "NoiseFit watch", adv.rssi)
+
+    scanner = BleakScanner(detection_callback=_cb)
+    await scanner.start()
+    try:
+        waited = 0.0
+        step = 0.1
+        while waited < timeout:
+            await asyncio.sleep(step)
+            waited += step
+            if early_exit and found:
+                break
+    finally:
+        await scanner.stop()
+
+    devices = sorted(found.values(),
+                     key=lambda d: seen_adv.get(d.address, ("", -999))[1], reverse=True)
+    for d in devices:
+        name, rssi = seen_adv.get(d.address, ("?", "?"))
+        log(f"  • {name}  [{d.address}]  rssi={rssi}")
+    return devices
+
+
+def _looks_like_mac(s: str) -> bool:
+    parts = s.replace("-", ":").split(":")
+    return len(parts) == 6 and all(len(p) == 2 for p in parts)
+
+
+async def find_ble_device(identifier: Optional[str], timeout: float, log=print):
+    """Resolve a watch to a BLEDevice for a fast, direct connect.
+
+    `identifier` may be a CoreBluetooth UUID (macOS), a BLE MAC (Linux/Windows),
+    a name substring, or None/"auto" to pick the strongest nearby NoiseFit watch.
+    Returns a BLEDevice, or None if nothing matched (caller can still try a raw
+    address connect on platforms where that works).
+    """
+    if timeout <= 0:
+        return None
+
+    ident = (identifier or "").strip()
+    auto = ident == "" or ident.lower() == "auto"
+
+    # A CoreBluetooth UUID can be resolved directly and cheaply on macOS.
+    if not auto and not _looks_like_mac(ident) and "-" in ident and len(ident) >= 32:
+        try:
+            log(f"→ Looking up {ident} …")
+            dev = await BleakScanner.find_device_by_address(ident, timeout=timeout)
+            if dev:
+                log(f"✓ Found {getattr(dev, 'name', None) or 'watch'}")
+                return dev
+        except Exception as e:
+            log(f"  ! lookup failed: {e}")
+
+    log(f"→ Scanning for watch … ({timeout:.0f}s max, stops early when found)")
+    devices = await scan_watches(timeout=timeout, log=log, early_exit=True)
+    if not devices:
+        log("  ! no NoiseFit watch found nearby")
+        return None
+
+    if auto:
+        return devices[0]
+
+    # Match the requested identifier against address or name; else fall back to
+    # the strongest watch we saw (common case: user passed a stale MAC on macOS).
+    want = ident.lower()
+    for d in devices:
+        if d.address.lower() == want or (d.name and want in d.name.lower()):
+            return d
+    log(f"  ! '{ident}' not matched; using nearest watch {devices[0].address}")
+    return devices[0]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 async def main():
     ap = argparse.ArgumentParser(description="NoiseFit Twist sync client")
-    ap.add_argument("mac", help="watch BLE MAC address")
+    ap.add_argument("mac", nargs="?", default=None,
+                    help="watch identifier: CoreBluetooth UUID (macOS), MAC (Linux/Win), "
+                         "name substring, or omit to auto-pick the nearest NoiseFit watch")
     ap.add_argument("--token", default=DEFAULT_TOKEN, help="verify-user-number token")
+    ap.add_argument("--scan-timeout", type=float, default=_env_float("NOISE_SCAN_TIMEOUT", 8.0),
+                    help="seconds to scan for the watch before connecting; 0 disables")
+    ap.add_argument("--connect-timeout", type=float, default=None,
+                    help="per-attempt BLE connect timeout; default NOISE_CONNECT_TIMEOUT or 8s")
+    ap.add_argument("--connect-attempts", type=int, default=None,
+                    help="BLE connect attempts; default NOISE_CONNECT_ATTEMPTS or 2")
     ap.add_argument("--time", action="store_true", help="sync time")
     ap.add_argument("--info", action="store_true", help="read device info")
     ap.add_argument("--battery", action="store_true", help="read battery")
@@ -650,7 +792,17 @@ async def main():
                 args.sleep, args.spo2, args.stress]):
         args.info = True
 
-    watch = NoiseTwist(args.mac, args.token)
+    ble_device = await find_ble_device(args.mac, args.scan_timeout)
+    if ble_device is None and (args.mac is None or sys.platform == "darwin"):
+        # On macOS a raw-address connect can't work (CoreBluetooth hides MACs),
+        # and with no identifier there's nothing to try. Fail fast instead of
+        # burning connect timeouts.
+        sys.exit("no watch found — make sure it's nearby and not connected to the phone app")
+
+    label = getattr(ble_device, "address", None) or args.mac or "watch"
+    watch = NoiseTwist(label, args.token, ble_device=ble_device,
+                       connect_timeout=args.connect_timeout,
+                       connect_attempts=args.connect_attempts)
     try:
         if not await watch.connect():
             sys.exit("connection failed")

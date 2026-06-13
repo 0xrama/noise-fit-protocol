@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>NoiseFit</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- draggable titlebar strip (sits under the native traffic lights) -->
+  <div class="titlebar"></div>
+
+  <!-- ───────────────── Connect screen ───────────────── -->
+  <section id="screen-connect" class="screen screen-connect">
+    <div class="connect-card">
+      <div class="brand">
+        <span class="wordmark">NoiseFit</span>
+        <span class="brand-rule" aria-hidden="true"></span>
+        <p class="lede">A quiet readout of your day. Connect a watch to begin.</p>
+      </div>
+
+      <button id="btn-scan" class="btn btn-primary">
+        <span class="btn-label">Scan for watch</span>
+        <span class="btn-arrow" aria-hidden="true">→</span>
+      </button>
+
+      <ul id="device-list" class="device-list" hidden></ul>
+
+      <div class="divider"><span>or enter manually</span></div>
+
+      <div class="manual">
+        <input id="manual-mac" class="field" type="text"
+               placeholder="UUID, MAC, or name" autocomplete="off" spellcheck="false" />
+        <button id="btn-connect-manual" class="btn btn-ghost">Connect</button>
+      </div>
+
+      <div id="connect-status" class="connect-status"></div>
+    </div>
+    <footer class="footer">Reverse-engineered BLE client · runs entirely on your Mac</footer>
+  </section>
+
+  <!-- ───────────────── Dashboard ───────────────── -->
+  <section id="screen-dash" class="screen screen-dash" hidden>
+    <aside class="sidebar">
+      <div class="device-id">
+        <span class="device-dot" aria-hidden="true"></span>
+        <div class="device-text">
+          <span id="dev-name" class="dev-name">NoiseFit</span>
+          <span id="dev-meta" class="dev-meta"></span>
+        </div>
+      </div>
+
+      <div id="battery" class="battery-tile" title="Battery">
+        <div class="battery-head">
+          <span class="tile-label">Battery</span>
+          <span id="batt-pct" class="batt-pct">—</span>
+        </div>
+        <div class="batt-shell"><div id="batt-fill" class="batt-fill"></div></div>
+      </div>
+
+      <nav class="side-actions">
+        <button id="btn-refresh" class="side-btn"><span class="side-ico">↻</span>Refresh data</button>
+        <button id="btn-sync-time" class="side-btn"><span class="side-ico">◷</span>Sync time</button>
+        <button id="btn-disconnect" class="side-btn side-btn-quiet"><span class="side-ico">⏏</span>Disconnect</button>
+      </nav>
+
+      <div class="side-foot" id="side-foot">Connected</div>
+    </aside>
+
+    <main class="content">
+      <header class="content-head">
+        <div>
+          <span id="today-date" class="today-date"></span>
+          <h2 id="greeting" class="greeting">Today</h2>
+        </div>
+        <select id="day-picker" class="day-picker" title="Saved days" hidden></select>
+      </header>
+
+      <div id="grid" class="grid">
+        <!-- Steps (wide) -->
+        <article class="card span-2" id="card-steps" style="--i:0">
+          <div class="card-head"><span class="card-title">Steps</span><span class="card-sub" id="steps-sub"></span></div>
+          <div class="metric"><span id="steps-total" class="metric-num">—</span><span class="metric-unit">steps today</span></div>
+          <div class="chart" id="chart-steps"></div>
+          <div class="card-foot" id="steps-foot"></div>
+        </article>
+
+        <!-- Heart rate (wide) -->
+        <article class="card span-2" id="card-hr" style="--i:1">
+          <div class="card-head"><span class="card-title">Heart rate</span><span class="card-sub" id="hr-sub"></span></div>
+          <div class="metric"><span id="hr-latest" class="metric-num">—</span><span class="metric-unit">bpm</span></div>
+          <div class="chart" id="chart-hr"></div>
+          <div class="card-foot" id="hr-foot"></div>
+        </article>
+
+        <!-- Sleep -->
+        <article class="card" id="card-sleep" style="--i:2">
+          <div class="card-head"><span class="card-title">Sleep</span></div>
+          <div class="metric"><span id="sleep-dur" class="metric-num">—</span></div>
+          <div class="sleep-bar" id="sleep-bar"></div>
+          <div class="card-foot" id="sleep-foot"></div>
+        </article>
+
+        <!-- SpO2 -->
+        <article class="card" id="card-spo2" style="--i:3">
+          <div class="card-head"><span class="card-title">Blood oxygen</span></div>
+          <div class="metric"><span id="spo2-latest" class="metric-num">—</span><span class="metric-unit">%</span></div>
+          <div class="card-foot" id="spo2-foot"></div>
+        </article>
+
+        <!-- Stress -->
+        <article class="card card-ring" id="card-stress" style="--i:4">
+          <div class="card-head"><span class="card-title">Stress</span></div>
+          <div class="ring-wrap">
+            <div class="ring" id="stress-ring"></div>
+            <div class="ring-center"><span id="stress-latest" class="metric-num">—</span></div>
+          </div>
+          <div class="card-foot" id="stress-foot"></div>
+        </article>
+
+        <!-- Calories / distance -->
+        <article class="card" id="card-activity" style="--i:5">
+          <div class="card-head"><span class="card-title">Activity</span></div>
+          <div class="stack">
+            <div class="stat"><span id="act-dist" class="stat-num">—</span><span class="stat-label">distance</span></div>
+            <div class="stat"><span id="act-cal" class="stat-num">—</span><span class="stat-label">calories</span></div>
+          </div>
+        </article>
+      </div>
+    </main>
+
+    <div id="toast" class="toast" hidden></div>
+  </section>
+
+  <script src="app.js"></script>
+  <script src="charts.js"></script>
+</body>
+</html>

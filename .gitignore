@@ -8,6 +8,7 @@ __pycache__/
 *$py.class
 *.so
 .venv/
+.run-app.log
 *.egg-info/
 dist/
 build/
