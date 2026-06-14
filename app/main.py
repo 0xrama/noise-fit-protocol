@@ -26,15 +26,48 @@ import webview
 # Allow `python -m app.main` and `python app/main.py` both to find noise_sync.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.service import PairingTokenRejected, WatchService  # noqa: E402
+from app.integrations import IntegrationError  # noqa: E402
+from app.service import PairingTokenRejected, WatchService, _jsonable  # noqa: E402
 
-WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "web")
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+WEB_DIR = os.path.join(ROOT_DIR, "web")
 WEB_DIR = os.path.abspath(WEB_DIR)
 
 # How long a single bridge call may run before the UI gives up and shows an
 # error instead of spinning forever. BLE ops complete in a few seconds; this is
 # only a backstop against a wedged Bluetooth stack.
 CALL_TIMEOUT = 45.0
+
+
+def load_env_local(path: str | None = None):
+    """Load repo-local secrets from .env.local without adding a dependency.
+
+    Existing environment variables win, so you can still override a value from
+    the shell. Supported syntax: KEY=value, optional `export`, optional quotes.
+    """
+    path = path or os.path.join(ROOT_DIR, ".env.local")
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export "):].strip()
+                if "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if not key:
+                    continue
+                if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+                    value = value[1:-1]
+                os.environ.setdefault(key, value)
+    except Exception:
+        traceback.print_exc()
 
 
 class Bridge:
@@ -72,7 +105,7 @@ class Bridge:
                 continue
             js = "window.dispatchEvent(new CustomEvent('watch:%s',{detail:%s}))" % (
                 event,
-                json.dumps(payload),
+                json.dumps(_jsonable(payload)),
             )
             try:
                 self.window.evaluate_js(js)
@@ -81,11 +114,22 @@ class Bridge:
 
     def _call(self, coro):
         try:
-            return self.service.run(coro).result(timeout=CALL_TIMEOUT)
+            return _jsonable(self.service.run(coro).result(timeout=CALL_TIMEOUT))
         except TimeoutError:
             return {"error": "The watch stopped responding. Move it closer and try again."}
         except PairingTokenRejected as e:
             return {"error": str(e), "code": e.code}
+        except Exception as e:
+            traceback.print_exc()
+            return {"error": str(e)}
+
+    def _integration_call(self, fn, *args):
+        try:
+            return _jsonable(fn(*args))
+        except TimeoutError:
+            return {"error": "The integration timed out. Try again."}
+        except IntegrationError as e:
+            return {"error": str(e)}
         except Exception as e:
             traceback.print_exc()
             return {"error": str(e)}
@@ -101,10 +145,10 @@ class Bridge:
         return self._call(self.service.connect(address, token or None))
 
     def memory(self):
-        return self.service.memory()
+        return _jsonable(self.service.memory())
 
     def records(self):
-        return self.service.records()
+        return _jsonable(self.service.records())
 
     def ensure_connected(self):
         return self._call(self.service.ensure_connected())
@@ -121,8 +165,26 @@ class Bridge:
     def default_token(self):
         return {"token": self.service.token}
 
+    def integration_status(self):
+        return _jsonable(self.service.integration_status())
+
+    def save_google_fit_config(self, client_id, client_secret=""):
+        return self._integration_call(self.service.save_google_fit_config, client_id, client_secret or "")
+
+    def sync_google_fit(self):
+        # May open a browser and wait for OAuth the first time, so don't use the
+        # short BLE timeout.
+        return self._integration_call(self.service.sync_google_fit)
+
+    def save_poke_key(self, api_key):
+        return self._integration_call(self.service.save_poke_key, api_key)
+
+    def send_to_poke(self):
+        return self._integration_call(self.service.send_latest_to_poke)
+
 
 def main():
+    load_env_local()
     service = WatchService()
     bridge = Bridge(service)
 

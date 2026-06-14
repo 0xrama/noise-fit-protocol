@@ -9,6 +9,7 @@ __pycache__/
 *.so
 .venv/
 .run-app.log
+.env.local
 *.egg-info/
 dist/
 build/

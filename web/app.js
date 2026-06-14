@@ -9,6 +9,7 @@ let connected = false;
 let rememberedAddress = "";
 let restoredMemory = false;
 let dayRecords = {};
+let integrationStatus = { google_fit: {}, poke: {} };
 
 /* ── tiny helpers ─────────────────────────────────────────────────────────── */
 function show(el, on = true) { el.hidden = !on; }
@@ -214,6 +215,71 @@ async function disconnect() {
   toast("Disconnected. Refresh reconnects when needed.");
 }
 
+/* ── external integrations ───────────────────────────────────────────────── */
+async function loadIntegrationStatus() {
+  if (!api() || !api().integration_status) return;
+  const res = await api().integration_status();
+  if (res && !res.error) integrationStatus = res;
+}
+
+async function syncGoogleFit() {
+  if (!api()) return;
+  const btn = $("btn-google-fit");
+  btn.disabled = true;
+  const old = btn.innerHTML;
+  btn.innerHTML = '<span class="side-ico">G</span>Syncing Google Fit…';
+  try {
+    await loadIntegrationStatus();
+    if (!integrationStatus.google_fit || !integrationStatus.google_fit.configured) {
+      const clientId = prompt("Google OAuth Desktop client ID\n\nCreate one in Google Cloud Console and enable Fitness API first:");
+      if (!clientId) return;
+      const secret = prompt("Google OAuth client secret (leave blank if your client has none):") || "";
+      const saved = await api().save_google_fit_config(clientId.trim(), secret.trim());
+      if (handleApiError(saved, "toast")) return;
+    }
+    setSideStatus("Opening Google Fit sync…");
+    const res = await api().sync_google_fit();
+    if (handleApiError(res, "toast")) return;
+    await loadIntegrationStatus();
+    const c = (res && res.counts) || {};
+    toast(`Google Fit synced: ${c.steps || 0} steps, ${c.heart || 0} HR, ${c.sleep || 0} sleep, ${c.spo2 || 0} SpO₂`);
+    setSideStatus("Google Fit sync complete");
+  } catch (err) {
+    toast("Google Fit sync failed: " + err);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = old;
+  }
+}
+
+async function sendToPoke() {
+  if (!api()) return;
+  const btn = $("btn-poke");
+  btn.disabled = true;
+  const old = btn.innerHTML;
+  btn.innerHTML = '<span class="side-ico">✦</span>Sending to Poke…';
+  try {
+    await loadIntegrationStatus();
+    if (!integrationStatus.poke || !integrationStatus.poke.configured) {
+      const key = prompt("Poke V2 API key\n\nCreate one at poke.com Kitchen → API Keys:");
+      if (!key) return;
+      const saved = await api().save_poke_key(key.trim());
+      if (handleApiError(saved, "toast")) return;
+    }
+    setSideStatus("Sending latest health data to Poke…");
+    const res = await api().send_to_poke();
+    if (handleApiError(res, "toast")) return;
+    await loadIntegrationStatus();
+    toast("Sent latest health data to Poke");
+    setSideStatus("Poke send complete");
+  } catch (err) {
+    toast("Poke send failed: " + err);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = old;
+  }
+}
+
 /* ── battery ─────────────────────────────────────────────────────────────── */
 function setBattery(pct, charging) {
   if (pct == null) return;
@@ -309,6 +375,7 @@ async function restoreMemory() {
     if (mem.last_data && typeof renderSteps === "function") render(mem.last_data);
     updateDayPicker(mem.last_data ? dayKey(mem.last_data.ts) : undefined);
     setSideStatus(mem.last_data ? "Showing saved data" : "Saved watch remembered");
+    loadIntegrationStatus();
   } catch (err) {
     setStatus("Could not load saved watch: " + err);
   }

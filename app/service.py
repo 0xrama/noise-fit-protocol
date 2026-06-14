@@ -23,6 +23,16 @@ from concurrent.futures import Future
 from pathlib import Path
 from typing import Callable, Optional
 
+from app.integrations import (  # noqa: E402
+    GoogleFitClient,
+    GoogleFitConfig,
+    IntegrationError,
+    build_fit_points,
+    run_google_oauth,
+    send_to_poke,
+    sleep_bounds,
+)
+
 # Reuse the verified client + decoders verbatim.
 from noise_sync import (  # noqa: E402
     NoiseTwist,
@@ -63,11 +73,39 @@ def _load_memory() -> dict:
         return {}
 
 
+def _jsonable(value):
+    """Return a copy of *value* that json.dumps/pywebview can encode.
+
+    The protobuf helper in noise_sync.py intentionally exposes length-delimited
+    fields as bytes. Most decoded values are ints/strings, but a few optional
+    watch fields can still surface as bytes on certain firmware. Never let raw
+    bytes escape to the UI bridge or the persisted memory file.
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value).hex()
+    if isinstance(value, (datetime.datetime, datetime.date)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {
+            (bytes(k).hex() if isinstance(k, (bytes, bytearray, memoryview)) else str(k)): _jsonable(v)
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple, set)):
+        return [_jsonable(v) for v in value]
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        return str(value)
+
+
 def _save_memory(memory: dict):
     path = _memory_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(memory, indent=2, sort_keys=True))
+    tmp.write_text(json.dumps(_jsonable(memory), indent=2, sort_keys=True))
     tmp.replace(path)
 
 
@@ -113,6 +151,7 @@ class WatchService:
         self._thread.start()
         self.watch: Optional[NoiseTwist] = None
         self._memory = _load_memory()
+        self._bootstrap_env_integrations()
         self.token = self._memory.get("token") or DEFAULT_TOKEN
         self.connected = False
         self._scan_cache: dict[str, object] = {}
@@ -135,7 +174,7 @@ class WatchService:
         self._emit("log", {"line": str(line)})
 
     def _remember(self, **updates):
-        self._memory.update({k: v for k, v in updates.items() if v is not None})
+        self._memory.update({k: _jsonable(v) for k, v in updates.items() if v is not None})
         self._memory["updated_at"] = _now_iso()
         _save_memory(self._memory)
 
@@ -147,16 +186,146 @@ class WatchService:
         self._remember()
 
     def memory(self) -> dict:
-        return dict(self._memory)
+        return _jsonable(dict(self._memory))
 
     def records(self) -> dict:
-        return dict(self._memory.get("records") or {})
+        return _jsonable(dict(self._memory.get("records") or {}))
 
     def _remember_record(self, data: dict):
+        data = _jsonable(data)
         day = _day_key(data.get("ts"))
         records = dict(self._memory.get("records") or {})
         records[day] = data
         self._remember(last_data=data, records=records)
+
+    def _bootstrap_env_integrations(self):
+        integrations = dict(self._memory.get("integrations") or {})
+        changed = False
+        gf = dict(integrations.get("google_fit") or {})
+        if os.environ.get("GOOGLE_FIT_CLIENT_ID") and not gf.get("client_id"):
+            gf["client_id"] = os.environ.get("GOOGLE_FIT_CLIENT_ID")
+            gf["client_secret"] = os.environ.get("GOOGLE_FIT_CLIENT_SECRET", "")
+            integrations["google_fit"] = gf
+            changed = True
+        poke = dict(integrations.get("poke") or {})
+        if os.environ.get("POKE_API_KEY") and not poke.get("api_key"):
+            poke["api_key"] = os.environ.get("POKE_API_KEY")
+            integrations["poke"] = poke
+            changed = True
+        if changed:
+            self._memory["integrations"] = integrations
+            _save_memory(self._memory)
+
+    def _remember_integration(self, name: str, data: dict):
+        integrations = dict(self._memory.get("integrations") or {})
+        existing = dict(integrations.get(name) or {})
+        existing.update(_jsonable(data))
+        integrations[name] = existing
+        self._remember(integrations=integrations)
+
+    def integration_status(self) -> dict:
+        integrations = self._memory.get("integrations") or {}
+        gf = integrations.get("google_fit") or {}
+        poke = integrations.get("poke") or {}
+        return {
+            "google_fit": {
+                "configured": bool(os.environ.get("GOOGLE_FIT_CLIENT_ID") or gf.get("client_id")),
+                "authorized": bool((gf.get("token") or {}).get("refresh_token") or (gf.get("token") or {}).get("access_token")),
+                "last_sync": gf.get("last_sync"),
+                "last_counts": gf.get("last_counts"),
+            },
+            "poke": {
+                "configured": bool(os.environ.get("POKE_API_KEY") or poke.get("api_key")),
+                "last_send": poke.get("last_send"),
+            },
+        }
+
+    def save_google_fit_config(self, client_id: str, client_secret: str = "") -> dict:
+        client_id = (client_id or "").strip()
+        client_secret = (client_secret or "").strip()
+        if not client_id:
+            raise IntegrationError("Google OAuth client ID is required.")
+        self._remember_integration("google_fit", {"client_id": client_id, "client_secret": client_secret})
+        return self.integration_status()["google_fit"]
+
+    def save_poke_key(self, api_key: str) -> dict:
+        api_key = (api_key or "").strip()
+        if not api_key:
+            raise IntegrationError("Poke API key is required.")
+        self._remember_integration("poke", {"api_key": api_key})
+        return self.integration_status()["poke"]
+
+    def sync_google_fit(self) -> dict:
+        data = self._memory.get("last_data") or {}
+        if not data:
+            raise IntegrationError("No health data cached yet. Refresh from the watch first.")
+        integrations = dict(self._memory.get("integrations") or {})
+        gf = dict(integrations.get("google_fit") or {})
+        client_id = (os.environ.get("GOOGLE_FIT_CLIENT_ID") or gf.get("client_id") or "").strip()
+        client_secret = (os.environ.get("GOOGLE_FIT_CLIENT_SECRET") or gf.get("client_secret") or "").strip()
+        if not client_id:
+            raise IntegrationError("Set up Google Fit first with an OAuth Desktop client ID.")
+        config = GoogleFitConfig(client_id=client_id, client_secret=client_secret)
+        token = dict(gf.get("token") or {})
+        if not token.get("access_token") and not token.get("refresh_token"):
+            token = run_google_oauth(config, log=self._log)
+            gf["token"] = token
+            self._remember_integration("google_fit", gf)
+
+        device_info = (self._memory.get("device") or {}).get("info") or {}
+        client = GoogleFitClient(config, token, device_info=device_info, log=self._log)
+        if client.refresh_if_needed():
+            gf["token"] = client.token
+            self._remember_integration("google_fit", gf)
+
+        points = build_fit_points(data)
+        sources = dict(gf.get("sources") or {})
+        source_defs = {
+            "steps": ("com.google.step_count.delta", "noisefit_steps", "derived"),
+            "heart": ("com.google.heart_rate.bpm", "noisefit_heart_rate", "raw"),
+            "sleep": ("com.google.sleep.segment", "noisefit_sleep", "raw"),
+            "spo2": ("com.google.oxygen_saturation", "noisefit_spo2", "raw"),
+        }
+        counts = {}
+        for key, pts in points.items():
+            if not pts:
+                counts[key] = 0
+                continue
+            data_type, stream_name, kind = source_defs[key]
+            stream_id, changed = client.ensure_source(sources, key, data_type, stream_name, kind)
+            if changed:
+                gf["sources"] = sources
+                self._remember_integration("google_fit", gf)
+            self._log(f"Uploading {len(pts)} {key} point(s) to Google Fit…")
+            counts[key] = client.patch_points(stream_id, pts)
+
+        bounds = sleep_bounds(data, points.get("sleep") or [])
+        if bounds and counts.get("sleep"):
+            client.put_sleep_session(bounds[0], bounds[1])
+
+        gf["token"] = client.token
+        gf["sources"] = sources
+        gf["last_sync"] = _now_iso()
+        gf["last_counts"] = counts
+        self._remember_integration("google_fit", gf)
+        return {
+            "ok": True,
+            "counts": counts,
+            "note": "Stress is included in Poke sends, but Google Fit has no standard visible stress history data type.",
+        }
+
+    def send_latest_to_poke(self) -> dict:
+        data = self._memory.get("last_data") or {}
+        if not data:
+            raise IntegrationError("No health data cached yet. Refresh from the watch first.")
+        integrations = self._memory.get("integrations") or {}
+        poke = dict(integrations.get("poke") or {})
+        api_key = (os.environ.get("POKE_API_KEY") or poke.get("api_key") or "").strip()
+        if not api_key:
+            raise IntegrationError("Set up Poke first with a V2 API key from Poke Kitchen.")
+        res = send_to_poke(api_key, _jsonable(data))
+        self._remember_integration("poke", {"api_key": api_key, "last_send": _now_iso()})
+        return {"ok": bool(res.get("success", True)), "response": res}
 
     async def ensure_connected(self) -> dict:
         if self._require():
@@ -191,9 +360,9 @@ class WatchService:
         self.token = token or self.token
         existing_address = self.watch.mac if self.watch else None
         if self._require() and existing_address == address:
-            info = self._memory.get("device", {}).get("info") or await self.watch.get_info()
+            info = _jsonable(self._memory.get("device", {}).get("info") or await self.watch.get_info() or {})
             self._emit("status", {"state": "connected", "address": address})
-            return info or {}
+            return info
 
         # Tear down only when switching devices or recovering a dead link. The
         # watch allows exactly one BLE connection, but reconnecting an already
@@ -260,7 +429,7 @@ class WatchService:
             )
 
         self.connected = True
-        info = await self.watch.get_info() or {}
+        info = _jsonable(await self.watch.get_info() or {})
         self._memory.pop("auth_error", None)
         self._remember(
             token=self.token,
@@ -294,11 +463,11 @@ class WatchService:
         data: dict = {"ts": datetime.datetime.now().isoformat(timespec="seconds")}
 
         try:
-            data["battery"] = await self.watch.get_battery()
+            data["battery"] = _jsonable(await self.watch.get_battery())
         except Exception as e:
             self._log(f"battery read failed: {e}")
             data["battery"] = None
-        self._emit("data", dict(data))
+        self._emit("data", _jsonable(dict(data)))
 
         # Each metric is pushed the moment it resolves; a slow/empty one never
         # holds up the cards that already came back.
@@ -309,9 +478,10 @@ class WatchService:
             ("spo2", "SpO2", self._spo2),
             ("stress", "stress", self._stress),
         ):
-            data[key] = await self._safe(label, fn)
-            self._emit("data", dict(data))
+            data[key] = _jsonable(await self._safe(label, fn))
+            self._emit("data", _jsonable(dict(data)))
 
+        data = _jsonable(data)
         self._remember_record(data)
         self._emit("status", {"state": "connected"})
         self._emit("data", data)

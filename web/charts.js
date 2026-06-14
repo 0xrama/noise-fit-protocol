@@ -179,6 +179,8 @@ function wire() {
   if (token) token.addEventListener("keydown", (e) => { if (e.key === "Enter") connect($("manual-mac").value.trim()); });
   $("btn-refresh").onclick = refresh;
   $("btn-sync-time").onclick = syncTime;
+  const gf = $("btn-google-fit"); if (gf) gf.onclick = syncGoogleFit;
+  const poke = $("btn-poke"); if (poke) poke.onclick = sendToPoke;
   $("btn-disconnect").onclick = disconnect;
   const picker = $("day-picker");
   if (picker) picker.onchange = () => renderSavedDay(picker.value);
