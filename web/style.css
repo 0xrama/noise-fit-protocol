@@ -153,6 +153,9 @@ body::before {
 .divider::before, .divider::after { content: ""; flex: 1; height: 1px; background: var(--rule); }
 
 .manual { display: flex; gap: 12px; align-items: flex-end; }
+.token-panel { display: flex; flex-direction: column; gap: 8px; }
+.token-label { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 1.4px; color: var(--ink-2); }
+.token-help { font-size: 12px; line-height: 1.35; color: var(--ink-3); }
 .connect-status { font-size: 13px; min-height: 18px; color: var(--ink-2); font-family: var(--font-mono); }
 .footer { font-size: 11px; color: var(--ink-3); letter-spacing: 0.2px; }
 

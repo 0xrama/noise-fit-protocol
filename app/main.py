@@ -26,7 +26,7 @@ import webview
 # Allow `python -m app.main` and `python app/main.py` both to find noise_sync.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.service import WatchService  # noqa: E402
+from app.service import PairingTokenRejected, WatchService  # noqa: E402
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "web")
 WEB_DIR = os.path.abspath(WEB_DIR)
@@ -84,6 +84,8 @@ class Bridge:
             return self.service.run(coro).result(timeout=CALL_TIMEOUT)
         except TimeoutError:
             return {"error": "The watch stopped responding. Move it closer and try again."}
+        except PairingTokenRejected as e:
+            return {"error": str(e), "code": e.code}
         except Exception as e:
             traceback.print_exc()
             return {"error": str(e)}

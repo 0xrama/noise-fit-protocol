@@ -175,6 +175,8 @@ function wire() {
   $("btn-scan").onclick = scan;
   $("btn-connect-manual").onclick = () => connect($("manual-mac").value.trim());
   $("manual-mac").addEventListener("keydown", (e) => { if (e.key === "Enter") connect($("manual-mac").value.trim()); });
+  const token = $("pairing-token");
+  if (token) token.addEventListener("keydown", (e) => { if (e.key === "Enter") connect($("manual-mac").value.trim()); });
   $("btn-refresh").onclick = refresh;
   $("btn-sync-time").onclick = syncTime;
   $("btn-disconnect").onclick = disconnect;

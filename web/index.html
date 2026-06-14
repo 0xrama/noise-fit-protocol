@@ -34,6 +34,13 @@
         <button id="btn-connect-manual" class="btn btn-ghost">Connect</button>
       </div>
 
+      <div id="token-panel" class="token-panel" hidden>
+        <label class="token-label" for="pairing-token">Pairing token</label>
+        <input id="pairing-token" class="field" type="password"
+               placeholder="Paste fresh Noise watch token" autocomplete="off" spellcheck="false" />
+        <p class="token-help">Only needed after the watch is unbound or factory-reset.</p>
+      </div>
+
       <div id="connect-status" class="connect-status"></div>
     </div>
     <footer class="footer">Reverse-engineered BLE client · runs entirely on your Mac</footer>

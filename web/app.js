@@ -28,6 +28,37 @@ function setStatus(msg, busy = false) {
   el.innerHTML = (busy ? '<span class="spin"></span>' : "") + (msg || "");
 }
 
+function showTokenPanel(on = true) {
+  const panel = $("token-panel");
+  if (panel) show(panel, on);
+}
+
+function pairingToken() {
+  const el = $("pairing-token");
+  return el ? el.value.trim() : "";
+}
+
+function leaveDashboard(message) {
+  connected = false;
+  show($("screen-dash"), false);
+  show($("screen-connect"), true);
+  showTokenPanel(true);
+  if (rememberedAddress) $("manual-mac").value = rememberedAddress;
+  setStatus(message || "Reconnect with a fresh pairing token.");
+}
+
+function handleApiError(res, surface = "status") {
+  if (!res || !res.error) return false;
+  if (res.code === "pairing_token_rejected") {
+    leaveDashboard(res.error);
+  } else if (surface === "toast") {
+    toast(res.error);
+  } else {
+    setStatus(res.error);
+  }
+  return true;
+}
+
 /* Sidebar live status — shows what the BLE layer is doing during a sync so the
    dashboard never looks frozen. Translates raw protocol log lines to plain text. */
 function setSideStatus(line) {
@@ -113,12 +144,12 @@ async function scan() {
 async function connect(address) {
   if (!api()) { setStatus("Bridge not ready yet."); return; }
   if (!address) { setStatus("Enter a UUID, MAC, or name first."); return; }
+  rememberedAddress = address;
   setStatus("Connecting… this can take a few seconds.", true);
   try {
-    const info = await api().connect(address);
-    if (info && info.error) { setStatus(info.error); return; }
+    const info = await api().connect(address, pairingToken() || null);
+    if (handleApiError(info)) return;
     connected = true;
-    rememberedAddress = address;
     enterDashboard(info || {});
     markLoading(true);
     refresh();
@@ -153,11 +184,11 @@ async function refresh() {
     if (!connected) {
       setSideStatus("Connecting…");
       const link = await api().ensure_connected();
-      if (link && link.error) { toast(link.error); return; }
+      if (handleApiError(link, "toast")) return;
       connected = true;
     }
     const data = await api().refresh();
-    if (data && data.error) toast(data.error);
+    if (handleApiError(data, "toast")) return;
     else render(data);
   } catch (err) {
     toast("Sync failed: " + err);
@@ -169,7 +200,7 @@ async function refresh() {
 async function syncTime() {
   if (!connected) {
     const link = await api().ensure_connected();
-    if (link && link.error) { toast(link.error); return; }
+    if (handleApiError(link, "toast")) return;
     connected = true;
   }
   const r = await api().sync_time();
@@ -212,10 +243,17 @@ function doneCard(id) { const c = $(id); if (c) c.classList.remove("loading"); }
 
 function emptyFoot(id, msg) { $(id).innerHTML = `<span class="empty">${msg}</span>`; }
 
+function localDateKey(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
 function dayKey(ts) {
-  if (!ts) return new Date().toISOString().slice(0, 10);
+  if (!ts) return localDateKey(new Date());
   const d = new Date(ts);
-  return Number.isNaN(d.getTime()) ? String(ts).slice(0, 10) : d.toISOString().slice(0, 10);
+  return Number.isNaN(d.getTime()) ? String(ts).slice(0, 10) : localDateKey(d);
 }
 
 function dayLabel(key) {
@@ -259,6 +297,11 @@ async function restoreMemory() {
     dayRecords = mem.records || {};
     rememberedAddress = device.address || mem.last_address || "";
     if (rememberedAddress) $("manual-mac").value = rememberedAddress;
+    if (mem.auth_error) {
+      showTokenPanel(true);
+      setStatus(mem.auth_error);
+      return;
+    }
     if (!device.info && !mem.last_data) return;
 
     connected = false;

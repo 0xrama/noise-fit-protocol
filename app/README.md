@@ -35,7 +35,9 @@ The dashboard pulls battery, steps, heart rate, sleep, SpO₂, and stress.
 - The watch accepts one BLE connection at a time — quit the official NoiseFit
   app first if it's connected.
 - Auth uses the captured pairing token (`DEFAULT_TOKEN` in `noise_sync.py`). If
-  it ever stops working, the watch was likely unbound or factory-reset.
+  it ever stops working, the watch was likely unbound or factory-reset. The app
+  keeps cached health records, clears stale pairing details, and prompts for a
+  fresh Noise watch token on the next connect.
 - The original `noise_sync.py` CLI is unchanged and still works on its own.
 
 ## Dependencies

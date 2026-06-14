@@ -71,6 +71,10 @@ def _save_memory(memory: dict):
     tmp.replace(path)
 
 
+class PairingTokenRejected(RuntimeError):
+    code = "pairing_token_rejected"
+
+
 def _now_iso() -> str:
     return datetime.datetime.now().isoformat(timespec="seconds")
 
@@ -134,6 +138,13 @@ class WatchService:
         self._memory.update({k: v for k, v in updates.items() if v is not None})
         self._memory["updated_at"] = _now_iso()
         _save_memory(self._memory)
+
+    def _forget_pairing(self, reason: str):
+        for key in ("token", "device", "last_address"):
+            self._memory.pop(key, None)
+        self._memory["auth_error"] = reason
+        self.token = DEFAULT_TOKEN
+        self._remember()
 
     def memory(self) -> dict:
         return dict(self._memory)
@@ -232,7 +243,14 @@ class WatchService:
         if result == "rejected":
             self.connected = False
             await self.watch.disconnect()
-            raise RuntimeError("Pairing token was rejected — the watch may have been unbound or reset.")
+            self.watch = None
+            reason = (
+                "Pairing token was rejected. The watch was likely unbound or reset; "
+                "scan again and paste a fresh pairing token from the Noise account."
+            )
+            self._forget_pairing(reason)
+            self._emit("status", {"state": "auth_failed", "address": address})
+            raise PairingTokenRejected(reason)
         if result != "ok":
             self.connected = False
             await self.watch.disconnect()
@@ -243,6 +261,7 @@ class WatchService:
 
         self.connected = True
         info = await self.watch.get_info() or {}
+        self._memory.pop("auth_error", None)
         self._remember(
             token=self.token,
             last_address=address,
