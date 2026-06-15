@@ -49,6 +49,7 @@ from noise_sync import (  # noqa: E402
     decode_hr,
     decode_sleep,
     decode_offline_measure,
+    decode_setime,
     pb_get,
 )
 
@@ -131,9 +132,13 @@ def _today_midnight() -> datetime.datetime:
     return datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
 
 
-def _series_points(values, freq_min: int):
-    """Turn a raw sample series into [{t: 'HH:MM', v: int}] keyed from 00:00."""
-    base = _today_midnight()
+def _series_points(values, freq_min: int, base: Optional[datetime.datetime] = None):
+    """Turn a raw sample series into [{t: 'HH:MM', v: int}] keyed from 00:00.
+
+    *base* is the midnight the buckets are anchored to — pass the watch's own
+    data-day so a sync just after midnight plots against the right day instead
+    of today. Falls back to today's midnight when the watch gives no date."""
+    base = base or _today_midnight()
     out = []
     for i, v in enumerate(values):
         t = base + datetime.timedelta(minutes=i * freq_min)
@@ -504,6 +509,9 @@ class WatchService:
         self.token = self._memory.get("token") or DEFAULT_TOKEN
         self.connected = False
         self._scan_cache: dict[str, object] = {}
+        # Midnight the current refresh's hourly series anchors to (the watch's
+        # data-day). None means "use today" — see refresh()/_series_points.
+        self._series_base: Optional[datetime.datetime] = None
 
     # ── loop plumbing ──────────────────────────────────────────────────────
     def _run_loop(self):
@@ -870,7 +878,25 @@ class WatchService:
             await self.ensure_connected()
 
         self._emit("status", {"state": "syncing"})
-        data: dict = {"ts": datetime.datetime.now().isoformat(timespec="seconds")}
+
+        # File this refresh under the day the WATCH says its data is for, not the
+        # Mac's clock. Right after midnight the watch still serves the previous
+        # day's dataset (keyed to that day's 00:00); trusting now() would mislabel
+        # it as today and re-anchor the hourly charts to the wrong midnight. The
+        # DAILY/steps dataset carries the canonical data-day; fall back to now().
+        now = datetime.datetime.now()
+        watch_day = None
+        try:
+            watch_day = await self.watch.fitness_date(FT_DAILY)
+        except Exception as e:
+            self._log(f"could not read watch data-day: {e}")
+        if watch_day:
+            self._series_base = watch_day.replace(hour=0, minute=0, second=0, microsecond=0)
+            ts = datetime.datetime.combine(watch_day.date(), now.time())
+        else:
+            self._series_base = None
+            ts = now
+        data: dict = {"ts": ts.isoformat(timespec="seconds")}
 
         try:
             data["battery"] = _jsonable(await self.watch.get_battery())
@@ -900,6 +926,7 @@ class WatchService:
 
         data = _jsonable(data)
         self._remember_record(data)
+        self._series_base = None
         self._emit("status", {"state": "connected"})
         self._emit("data", data)
         return data
@@ -919,7 +946,7 @@ class WatchService:
             "distance_m": sum(dist),
             "calories": sum(cal),
             "freq_min": freq,
-            "series": _series_points(steps, freq),
+            "series": _series_points(steps, freq, getattr(self, "_series_base", None)),
         }
 
     async def _heart(self) -> dict:
@@ -928,7 +955,7 @@ class WatchService:
             return {}
         freq = d.get("freq_min") or 5
         samples = d.get("samples") or []
-        pts = [p for p in _series_points(samples, freq) if p["v"] > 0]
+        pts = [p for p in _series_points(samples, freq, getattr(self, "_series_base", None)) if p["v"] > 0]
         return {
             "min": d.get("min"),
             "max": d.get("max"),

@@ -154,6 +154,7 @@ async function connect(address) {
     enterDashboard(info || {});
     markLoading(true);
     refresh();
+    AutoSync.applyTimer();   // keep syncing on the chosen interval while open
   } catch (err) {
     setStatus("Connection failed: " + err);
   }
@@ -178,7 +179,15 @@ function enterDashboard(info) {
 }
 
 /* ── dashboard actions ───────────────────────────────────────────────────── */
+// The watch allows ONE BLE conversation at a time, so a manual Refresh and an
+// auto-sync tick must never run together. This guard lets either caller bail
+// out cleanly if a sync is already in flight.
+let syncing = false;
+
 async function refresh() {
+  if (syncing) return;
+  if (!api()) { toast("Bridge not ready yet — try again."); return; }
+  syncing = true;
   const btn = $("btn-refresh");
   btn.disabled = true; btn.textContent = "Syncing…";
   try {
@@ -195,6 +204,7 @@ async function refresh() {
     toast("Sync failed: " + err);
   } finally {
     btn.disabled = false; btn.textContent = "Refresh";
+    syncing = false;
   }
 }
 
@@ -211,8 +221,88 @@ async function syncTime() {
 async function disconnect() {
   await api().disconnect();
   connected = false;
+  AutoSync.stopTimer();   // don't keep waking a watch the user just released
   setSideStatus("Disconnected — cached data stays here");
   toast("Disconnected. Refresh reconnects when needed.");
+}
+
+/* ── auto-sync ────────────────────────────────────────────────────────────────
+   Two independent, user-toggled behaviours, persisted in localStorage:
+
+   • onOpen   — sync once shortly after the app launches and a remembered watch
+                is restored, so the dashboard is fresh without a manual Refresh.
+   • interval — when the app stays open, keep syncing every N minutes (5 or 10).
+
+   Both funnel through refresh(), which already auto-connects and is guarded
+   against overlapping syncs, so we never stack BLE conversations. A periodic
+   tick that fails is silent (refresh() toasts once); the next tick just retries. */
+const AutoSync = {
+  KEY: "noisefit.autosync",
+  defaults: { onOpen: true, interval: 0 },   // interval in minutes; 0 = off
+  _timer: null,
+
+  prefs() {
+    try {
+      return { ...this.defaults, ...JSON.parse(localStorage.getItem(this.KEY) || "{}") };
+    } catch { return { ...this.defaults }; }
+  },
+
+  save(patch) {
+    const next = { ...this.prefs(), ...patch };
+    try { localStorage.setItem(this.KEY, JSON.stringify(next)); } catch {}
+    this.applyTimer();
+    return next;
+  },
+
+  // Called once a watch has been restored/connected, so the first sync has
+  // something to connect to. Runs the on-open sync, then arms the interval.
+  start() {
+    if (this.prefs().onOpen) {
+      // Defer slightly so the bridge + restore settle before we grab the link.
+      setTimeout(() => { if (!syncing) refresh(); }, 800);
+    }
+    this.applyTimer();
+  },
+
+  applyTimer() {
+    this.stopTimer();
+    const mins = Number(this.prefs().interval) || 0;
+    if (mins > 0) {
+      this._timer = setInterval(() => {
+        if (!syncing && api()) refresh();
+      }, mins * 60 * 1000);
+    }
+  },
+
+  stopTimer() {
+    if (this._timer) { clearInterval(this._timer); this._timer = null; }
+  },
+};
+
+/* Reflect saved prefs into the sidebar controls and persist changes. */
+function wireAutoSync() {
+  const sw = $("autosync-onopen");
+  const sel = $("autosync-interval");
+  if (!sw || !sel) return;
+  const p = AutoSync.prefs();
+
+  sw.setAttribute("aria-checked", p.onOpen ? "true" : "false");
+  sw.classList.toggle("on", !!p.onOpen);
+  sel.value = String(p.interval || 0);
+
+  sw.onclick = () => {
+    const on = sw.getAttribute("aria-checked") !== "true";
+    sw.setAttribute("aria-checked", on ? "true" : "false");
+    sw.classList.toggle("on", on);
+    AutoSync.save({ onOpen: on });
+    toast(on ? "Will sync each time the app opens" : "Sync-on-open off");
+  };
+
+  sel.onchange = () => {
+    const mins = Number(sel.value) || 0;
+    AutoSync.save({ interval: mins });
+    toast(mins ? `Syncing every ${mins} minutes while open` : "Periodic sync off");
+  };
 }
 
 /* ── external integrations ───────────────────────────────────────────────── */
@@ -386,6 +476,7 @@ async function restoreMemory() {
     if (typeof refreshHealthspanCard === "function") refreshHealthspanCard();
     setSideStatus(mem.last_data ? "Showing saved data" : "Saved watch remembered");
     loadIntegrationStatus();
+    AutoSync.start();   // sync-on-open + arm the periodic timer if enabled
   } catch (err) {
     setStatus("Could not load saved watch: " + err);
   }

@@ -329,6 +329,26 @@ def msg_setime_pb(year, month, day, hour=0, minute=0, second=0) -> bytes:
             + pb_field_varint(4, hour) + pb_field_varint(5, minute) + pb_field_varint(6, second))
 
 
+def decode_setime(buf: bytes) -> Optional[datetime.datetime]:
+    """Decode a SETime struct → datetime, or None if it isn't a valid date.
+
+    The watch tags every fitness dataset with the calendar day it belongs to.
+    Continuous types (steps/HR) are keyed to 00:00 of that day; spot measures
+    carry the exact capture time. Either way this is the day the data is *for* —
+    which can differ from the Mac's clock right after midnight, before the watch
+    has rolled into a fresh day's dataset."""
+    if not buf:
+        return None
+    y, mo, d = pb_get(buf, 1), pb_get(buf, 2), pb_get(buf, 3)
+    h, mi, s = pb_get(buf, 4) or 0, pb_get(buf, 5) or 0, pb_get(buf, 6) or 0
+    if not (isinstance(y, int) and isinstance(mo, int) and isinstance(d, int)):
+        return None
+    try:
+        return datetime.datetime(y, mo, d, h, mi, s)
+    except (ValueError, TypeError):
+        return None
+
+
 def msg_request_fitness(setime: bytes, ftype: int) -> bytes:
     # SEWear{ id=113, fitness{ fitness_type_id{ time, fitness_function_type } } }
     type_id = pb_field_bytes(1, setime) + pb_field_varint(2, ftype)
@@ -612,6 +632,16 @@ class NoiseTwist:
             base = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
             return msg_setime_pb(base.year, base.month, base.day)
         return None
+
+    async def fitness_date(self, ftype: int) -> Optional[datetime.datetime]:
+        """The calendar day the watch tags *ftype*'s dataset with, or None.
+
+        Lets callers file a refresh under the day the data is actually for
+        (per the watch) instead of the Mac's clock — which matters right after
+        midnight, before the watch has opened a new day's dataset."""
+        entries = await self._fitness_entries()
+        setime = self._setime_for(ftype, entries)
+        return decode_setime(setime) if setime else None
 
     async def _pull_fitness(self, ftype: int, decoder, label: str, *, confirm: bool = True):
         entries = await self._fitness_entries()

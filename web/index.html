@@ -71,6 +71,7 @@
         <button class="page-tab" data-page="heart"><span class="tab-ico">♥</span>Heart rate</button>
         <button class="page-tab" data-page="steps"><span class="tab-ico">⊝</span>Steps</button>
         <button class="page-tab" data-page="activity"><span class="tab-ico">⟁</span>Activity</button>
+        <button class="page-tab" data-page="weekly"><span class="tab-ico">▦</span>Weekly review</button>
         <button class="page-tab" data-page="healthspan"><span class="tab-ico">∞</span>Healthspan</button>
       </nav>
 
@@ -81,6 +82,22 @@
         <button id="btn-poke" class="side-btn"><span class="side-ico">✦</span>Send data to Poke</button>
         <button id="btn-disconnect" class="side-btn side-btn-quiet"><span class="side-ico">⏏</span>Disconnect</button>
       </nav>
+
+      <div class="autosync" id="autosync">
+        <div class="autosync-row">
+          <span class="tile-label">Auto-sync</span>
+          <button id="autosync-onopen" class="switch" role="switch" aria-checked="false" aria-label="Sync when the app opens"><span class="switch-knob"></span></button>
+        </div>
+        <span class="autosync-hint">Sync each time the app opens</span>
+        <div class="autosync-row autosync-interval">
+          <span class="autosync-sub">Keep syncing</span>
+          <select id="autosync-interval" class="autosync-select" title="Sync repeatedly while open">
+            <option value="0">Off</option>
+            <option value="5">Every 5 min</option>
+            <option value="10">Every 10 min</option>
+          </select>
+        </div>
+      </div>
 
       <div class="side-foot" id="side-foot">Connected</div>
     </aside>
@@ -231,6 +248,19 @@
           <article class="panel span-2"><div class="panel-head">Calories trend</div><div class="trend" id="ac-cal-trend"></div><div class="panel-foot" id="ac-cal-foot"></div></article>
           <article class="panel span-2"><div class="panel-head">Distance trend</div><div class="trend" id="ac-dist-trend"></div><div class="panel-foot" id="ac-dist-foot"></div></article>
           <article class="panel span-4"><div class="panel-head">Weekly movement</div><div class="trend" id="ac-weekly"></div><div class="panel-foot" id="ac-weekly-foot"></div></article>
+        </div>
+      </section>
+
+      <!-- ───────── Weekly review page ───────── -->
+      <section class="page-view" id="page-weekly">
+        <div class="detail-hero">
+          <div class="hero-num"><span id="wk-range" class="metric-num">This week</span><span class="metric-unit" id="wk-range-sub"></span></div>
+          <div class="hero-stats" id="wk-hero-stats"></div>
+        </div>
+        <div class="panel-grid">
+          <article class="panel span-4"><div class="panel-head">Steps · across the week</div><div class="trend tall" id="wk-steps"></div><div class="panel-foot" id="wk-steps-foot"></div></article>
+          <article class="panel span-4"><div class="panel-head">Sleep · across the week</div><div class="trend tall" id="wk-sleep"></div><div class="panel-foot" id="wk-sleep-foot"></div></article>
+          <article class="panel span-4"><div class="panel-head">Activity score · across the week</div><div class="trend tall" id="wk-activity"></div><div class="panel-foot" id="wk-activity-foot"></div></article>
         </div>
       </section>
 

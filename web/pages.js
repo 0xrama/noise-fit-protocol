@@ -13,6 +13,7 @@ const PAGE_TITLES = {
   heart: "Heart rate",
   steps: "Steps",
   activity: "Activity",
+  weekly: "Weekly review",
   healthspan: "Healthspan",
 };
 
@@ -39,6 +40,7 @@ function renderCurrentPage() {
     case "heart": renderHeartPage(records, selected); break;
     case "steps": renderStepsPage(records, selected); break;
     case "activity": renderActivityPage(records, selected); break;
+    case "weekly": renderWeeklyPage(records, selected); break;
     case "healthspan": renderHealthspanPage(); break;
   }
 }
@@ -326,7 +328,93 @@ function renderWeekly(id, records) {
   $("ac-weekly-foot").textContent = `${weeks.length} week${weeks.length === 1 ? "" : "s"}  ·  weekly step totals`;
 }
 
-/* ── Healthspan page ────────────────────────────────────────────────────────── */
+/* ── Weekly review page ──────────────────────────────────────────────────────
+   A 7-day recap ending on the selected (or most recent) day: step history,
+   sleep history, then a derived daily activity score. Reuses dayRecords +
+   the shared chart helpers; days with no data show as quiet empty slots so
+   the week always reads as a full 7-bar span. */
+
+/* The 7 day-keys ending at `endKey`, oldest-first, with weekday labels. */
+function weekDayKeys(endKey) {
+  const end = new Date((endKey || localDateKey(new Date())) + "T12:00:00");
+  if (Number.isNaN(end.getTime())) return [];
+  const out = [];
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date(end);
+    d.setDate(end.getDate() - i);
+    out.push({ key: localDateKey(d), label: d.toLocaleDateString(undefined, { weekday: "short" }) });
+  }
+  return out;
+}
+
+/* Derived 0–100 daily activity score from steps / distance / calories.
+   Steps lead (most reliable signal), with distance & calories as bonuses,
+   blending only the components that are present. */
+function activityScore(steps) {
+  if (!steps) return null;
+  const total = num(steps.today_steps != null ? steps.today_steps : steps.total);
+  const cal = num(steps.calories);
+  const distKm = num(steps.distance_m) != null ? num(steps.distance_m) / 1000 : null;
+  const parts = [];
+  if (total != null) parts.push({ v: clamp(total / 8000 * 100, 0, 100), w: 0.6 });
+  if (cal != null) parts.push({ v: clamp(cal / 600 * 100, 0, 100), w: 0.2 });
+  if (distKm != null) parts.push({ v: clamp(distKm / 6 * 100, 0, 100), w: 0.2 });
+  if (!parts.length) return null;
+  const wsum = parts.reduce((a, p) => a + p.w, 0);
+  return Math.round(parts.reduce((a, p) => a + p.v * p.w, 0) / wsum);
+}
+
+function renderWeeklyPage(records, selectedDay) {
+  const recs = records || {};
+  // End the week on the selected day if it has data, else the latest saved day.
+  const savedDays = Object.keys(recs).sort();
+  const endKey = (selectedDay && recs[selectedDay]) ? selectedDay : (savedDays[savedDays.length - 1] || selectedDay);
+  const days = weekDayKeys(endKey);
+  if (!days.length) {
+    $("wk-range").textContent = "This week";
+    $("wk-hero-stats").innerHTML = "";
+    ["wk-steps", "wk-sleep", "wk-activity"].forEach((id) => emptyPanel(id, "No data for this week yet."));
+    return;
+  }
+
+  // Range label across the hero.
+  $("wk-range").textContent = dayLabel(days[0].key) + " – " + dayLabel(days[6].key);
+  $("wk-range-sub").textContent = "7-day recap";
+
+  const stepVals = days.map((d) => num(recs[d.key] && recs[d.key].steps && (recs[d.key].steps.today_steps ?? recs[d.key].steps.total)));
+  const sleepVals = days.map((d) => num(recs[d.key] && recs[d.key].sleep && recs[d.key].sleep.duration));
+  const actVals = days.map((d) => activityScore(recs[d.key] && recs[d.key].steps));
+
+  const trackedSteps = stepVals.filter((v) => v != null && v > 0);
+  const trackedSleep = sleepVals.filter((v) => v != null && v > 0);
+  const trackedAct = actVals.filter((v) => v != null);
+
+  $("wk-hero-stats").innerHTML =
+    heroStat("avg steps", trackedSteps.length ? fmt(Math.round(avg(trackedSteps))) : "—", `${trackedSteps.length}/7 days`) +
+    heroStat("avg sleep", trackedSleep.length ? fmtSleepMins(Math.round(avg(trackedSleep))) : "—", `${trackedSleep.length}/7 nights`) +
+    heroStat("avg activity", trackedAct.length ? Math.round(avg(trackedAct)) : "—", trackedAct.length ? "of 100" : "");
+
+  // Steps — one bar per weekday (zero-filled so the full week always shows).
+  const stepPts = days.map((d, i) => ({ t: d.label, v: stepVals[i] || 0 }));
+  $("wk-steps").innerHTML = barchart(stepPts, "#57e8a6", { tooltip: true, unit: "steps" });
+  $("wk-steps-foot").textContent = trackedSteps.length
+    ? `total ${fmt(trackedSteps.reduce((a, v) => a + v, 0))} steps  ·  best ${fmt(Math.max(...trackedSteps))}`
+    : "Step history fills in as days sync.";
+
+  // Sleep — hours per night, with a stage-color key in the legend.
+  const sleepPts = days.map((d, i) => ({ t: d.label, v: sleepVals[i] ? +(sleepVals[i] / 60).toFixed(1) : 0 }));
+  $("wk-sleep").innerHTML = barchart(sleepPts, "var(--sleep-light)", { tooltip: true, unit: "h" });
+  $("wk-sleep-foot").textContent = trackedSleep.length
+    ? `avg ${fmtSleepMins(Math.round(avg(trackedSleep)))}  ·  ${trackedSleep.length} night${trackedSleep.length === 1 ? "" : "s"}`
+    : "Sleep history fills in as nights sync.";
+
+  // Activity score — bar per day (0–100).
+  const actPts = days.map((d, i) => ({ t: d.label, v: actVals[i] || 0 }));
+  $("wk-activity").innerHTML = barchart(actPts, "var(--warn)", { tooltip: true, unit: "/100" });
+  $("wk-activity-foot").textContent = trackedAct.length
+    ? `avg ${Math.round(avg(trackedAct))}/100  ·  peak ${Math.max(...trackedAct)}  ·  steps-led, with distance & calories`
+    : "Activity score is derived from steps, distance and calories.";
+}
 let healthspanLoading = false;
 
 async function renderHealthspanPage() {

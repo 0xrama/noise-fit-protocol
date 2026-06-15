@@ -509,6 +509,7 @@ function wire() {
   const gf = $("btn-google-fit"); if (gf) gf.onclick = syncGoogleFit;
   const poke = $("btn-poke"); if (poke) poke.onclick = sendToPoke;
   $("btn-disconnect").onclick = disconnect;
+  if (typeof wireAutoSync === "function") wireAutoSync();
   const picker = $("day-picker");
   if (picker) picker.onchange = () => renderSavedDay(picker.value);
 }
