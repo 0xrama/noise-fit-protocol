@@ -118,13 +118,13 @@ async function scan() {
   setStatus("Scanning…", true);
   show($("device-list"), false);
   try {
-    const res = await api().scan(4);
+    const res = await api().scan(10);
     if (res.error) { setStatus(res.error); return; }
     const devices = res.devices || [];
     const list = $("device-list");
     list.innerHTML = "";
     if (!devices.length) {
-      setStatus("No watches found. Make sure it's nearby, or enter the MAC manually.");
+      setStatus("No watches found. Wake the watch, keep it close, disconnect the phone app, then scan again.");
     } else {
       setStatus("");
       devices.forEach((d) => {
@@ -286,7 +286,7 @@ function setBattery(pct, charging) {
   $("batt-pct").textContent = pct + "%";
   const fill = $("batt-fill");
   fill.style.width = Math.max(4, Math.min(100, pct)) + "%";
-  fill.style.background = charging ? "#4f7a5b" : pct <= 20 ? "#b23a48" : pct <= 40 ? "#b8852a" : "#4f7a5b";
+  fill.style.background = charging ? "#57e8a6" : pct <= 20 ? "#ff6f91" : pct <= 40 ? "#ffc56b" : "#57e8a6";
 }
 
 /* ── render dashboard payload ────────────────────────────────────────────── */
@@ -303,6 +303,10 @@ function render(data) {
   if ("sleep" in data) { renderSleep(data.sleep || {}); doneCard("card-sleep"); }
   if ("spo2" in data) { renderSpo2(data.spo2 || {}); doneCard("card-spo2"); }
   if ("stress" in data) { renderStress(data.stress || {}); doneCard("card-stress"); }
+  if (typeof renderWellness === "function") renderWellness(dayRecords);
+  if (typeof renderSleepHistory === "function") renderSleepHistory(dayRecords, dayKey(data.ts));
+  if (typeof renderCurrentPage === "function" && typeof currentPage !== "undefined" && currentPage !== "overview") renderCurrentPage();
+  if (typeof refreshHealthspanCard === "function") refreshHealthspanCard();
 }
 
 function doneCard(id) { const c = $(id); if (c) c.classList.remove("loading"); }
@@ -330,8 +334,10 @@ function dayLabel(key) {
 
 function rememberDayRecord(data) {
   if (!data || !data.ts || !("steps" in data || "heart" in data || "sleep" in data || "spo2" in data || "stress" in data)) return;
-  dayRecords[dayKey(data.ts)] = data;
+  dayRecords[dayKey(data.ts)] = { ...(dayRecords[dayKey(data.ts)] || {}), ...data };
   updateDayPicker(dayKey(data.ts));
+  if (typeof renderWellness === "function") renderWellness(dayRecords);
+  if (typeof renderSleepHistory === "function") renderSleepHistory(dayRecords, dayKey(data.ts));
 }
 
 function updateDayPicker(selected) {
@@ -373,7 +379,11 @@ async function restoreMemory() {
     connected = false;
     enterDashboard(device.info || {});
     if (mem.last_data && typeof renderSteps === "function") render(mem.last_data);
-    updateDayPicker(mem.last_data ? dayKey(mem.last_data.ts) : undefined);
+    const selectedDay = mem.last_data ? dayKey(mem.last_data.ts) : undefined;
+    updateDayPicker(selectedDay);
+    if (typeof renderWellness === "function") renderWellness(dayRecords);
+    if (typeof renderSleepHistory === "function") renderSleepHistory(dayRecords, selectedDay);
+    if (typeof refreshHealthspanCard === "function") refreshHealthspanCard();
     setSideStatus(mem.last_data ? "Showing saved data" : "Saved watch remembered");
     loadIntegrationStatus();
   } catch (err) {

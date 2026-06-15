@@ -418,24 +418,54 @@ def decode_offline_measure(buf: bytes, fitness_field: int) -> list:
     return [(pb_get(m, 1), pb_get(m, 2)) for m in measures]
 
 
+def _decode_sleep_stage(buf: bytes) -> Optional[dict]:
+    """Decode one SESleepDistributionData record.
+
+    Firmware observed so far wraps the repeated stage records inside the sleep
+    field-14 payload (field 14 -> SEList -> repeated field 1 -> stage).  The
+    first decoder treated the wrapper itself as a stage, which surfaced the
+    nested stage bytes as a hex string in the UI.  Accept both shapes so older
+    captures and future firmware variants work.
+    """
+    start = pb_get(buf, 1)
+    duration = pb_get(buf, 2)
+    raw_type = pb_get(buf, 3)
+    if not isinstance(start, int) or not isinstance(duration, int) or not isinstance(raw_type, int):
+        return None
+    return {
+        "start": start,
+        "duration": duration,
+        "type": {0: "awake", 1: "light", 2: "deep", 3: "rem"}.get(raw_type, "?"),
+    }
+
+
+def _decode_sleep_stage_container(buf: bytes) -> list[dict]:
+    direct = _decode_sleep_stage(buf)
+    if direct:
+        return [direct]
+    out = []
+    for child in pb_get_all(buf, 1):
+        if isinstance(child, (bytes, bytearray)):
+            out.extend(_decode_sleep_stage_container(bytes(child)))
+    return out
+
+
 def decode_sleep(buf: bytes) -> dict:
     fitness = pb_get(buf, 9) or b""
     sleep = pb_get(fitness, 5) or b""        # SESleepData
     stages = []
-    for s in pb_get_all(sleep, 14):          # SESleepDistributionData list
-        stages.append({
-            "start": pb_get(s, 1),
-            "duration": pb_get(s, 2),
-            "type": {0: "awake", 1: "light", 2: "deep", 3: "rem"}.get(pb_get(s, 3), "?"),
-        })
+    for s in pb_get_all(sleep, 14):          # SESleepDistributionData.SEList / records
+        stages.extend(_decode_sleep_stage_container(s))
+    stages.sort(key=lambda x: x.get("start") or 0)
     return {
         "start": pb_get(sleep, 2),
         "end": pb_get(sleep, 3),
         "duration": pb_get(sleep, 4),
         "score": pb_get(sleep, 5),
-        "deep_min": pb_get(sleep, 10),
-        "light_min": pb_get(sleep, 8),
         "awake_min": pb_get(sleep, 6),
+        "light_min": pb_get(sleep, 8),
+        "deep_min": pb_get(sleep, 10),
+        "rem_min": pb_get(sleep, 12),
         "stages": stages,
     }
 
@@ -583,7 +613,7 @@ class NoiseTwist:
             return msg_setime_pb(base.year, base.month, base.day)
         return None
 
-    async def _pull_fitness(self, ftype: int, decoder, label: str):
+    async def _pull_fitness(self, ftype: int, decoder, label: str, *, confirm: bool = True):
         entries = await self._fitness_entries()
         setime = self._setime_for(ftype, entries)
         if setime is None:
@@ -595,9 +625,12 @@ class NoiseTwist:
             self.log("  ! no data")
             return None
         decoded = decoder(resp)
-        # Confirm + await the ack so each exchange is fully serialized before the next
-        # request (the watch won't stream a 2nd type until the 1st is confirmed).
-        await self.transport.request(msg_confirm_fitness(setime, ftype), timeout=3.0)
+        if confirm:
+            # Confirm + await the ack so each exchange is fully serialized before the next
+            # request (the watch won't stream a 2nd type until the 1st is confirmed).
+            await self.transport.request(msg_confirm_fitness(setime, ftype), timeout=3.0)
+        else:
+            self.log("  kept unconfirmed so the watch can offer this data again")
         return decoded
 
     async def pull_steps(self):
@@ -625,14 +658,16 @@ class NoiseTwist:
             self.log(f"    … (+{len(nz)-12} more)")
 
     async def pull_sleep(self):
-        d = await self._pull_fitness(FT_SLEEP, decode_sleep, "SLEEP")
+        d = await self._pull_fitness(FT_SLEEP, decode_sleep, "SLEEP", confirm=False)
         if not d:
             return
         if not d.get("start"):
             self.log("  (no sleep data for today)")
             return
-        self.log(f"  sleep {d['start']} → {d['end']}  score {d['score']}  "
-                 f"deep {d['deep_min']}min light {d['light_min']}min")
+        start = datetime.datetime.fromtimestamp(d["start"]).strftime("%H:%M") if d.get("start") else "?"
+        end = datetime.datetime.fromtimestamp(d["end"]).strftime("%H:%M") if d.get("end") else "?"
+        self.log(f"  sleep {start} → {end}  ({d.get('duration')}min)  score {d['score']}  "
+                 f"deep {d['deep_min']}min light {d['light_min']}min rem {d.get('rem_min')}min")
         for st in d["stages"]:
             self.log(f"    stage {st['type']:6s} @ {st['start']}  {st['duration']}min")
 

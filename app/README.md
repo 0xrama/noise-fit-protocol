@@ -13,7 +13,9 @@ today's health data at a glance. Built on the reverse-engineered protocol in
 ```
 
 Then: **Scan for watch** (or type the MAC, e.g. `14:55:b9:5a:c9:fa`) → connect.
-The dashboard pulls battery, steps, heart rate, sleep, SpO₂, and stress.
+The dashboard pulls battery, steps, heart rate, sleep, SpO₂, and stress. Sleep
+shows a quality score from the watch when available, with a stage-based fallback.
+Recovery and biological-age trend cards unlock after 20 valid sleep-history days.
 **Refresh** re-syncs, **Sync time** fixes the watch clock. The sidebar also has
 **Sync to Google Fit** and **Send data to Poke** actions for the latest cached
 watch data.

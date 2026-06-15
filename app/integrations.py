@@ -53,7 +53,7 @@ class IntegrationError(RuntimeError):
 
 def _json_request(method: str, url: str, payload: Optional[dict] = None, headers: Optional[dict] = None, timeout: int = 30) -> dict:
     body = None if payload is None else json.dumps(payload).encode("utf-8")
-    req_headers = {"Accept": "application/json"}
+    req_headers = {"Accept": "application/json", "User-Agent": "NoiseFit-Local-Sync/1.0"}
     if payload is not None:
         req_headers["Content-Type"] = "application/json; charset=utf-8"
     if headers:
@@ -425,22 +425,123 @@ def sleep_bounds(data: dict, sleep_points: list[dict]) -> Optional[tuple[_dt.dat
 
 
 def send_to_poke(api_key: str, data: dict) -> dict:
-    if not api_key:
-        raise IntegrationError("Missing Poke API key. Create a V2 key in Poke Kitchen → API Keys.")
+    api_key = normalize_poke_api_key(api_key)
+    compact = compact_health_day(data)
     summary = summarize_health_day(data)
     payload = {
-        "message": "Here is my latest NoiseFit health data. Please record/summarize it and use it as context for my health history.",
-        "summary": summary,
+        "message": build_poke_message(summary, compact),
+        "schema_version": "noisefit-health-v1",
+        "kind": "fitness_data_import",
         "source": "NoiseFit Local Sync",
-        "data": data,
+        "summary": summary,
+        "captured_at": data.get("ts"),
+        # Poke docs say the entire JSON object is forwarded to the agent as
+        # context. Keep a compact digest for easy reading and the full watch
+        # payload for detailed trend/history work.
+        "fitness_digest": compact,
+        "fitness_data": data,
     }
-    return _json_request(
-        "POST",
-        POKE_ENDPOINT,
-        payload,
-        headers={"Authorization": f"Bearer {api_key}"},
-        timeout=30,
+    try:
+        res = _json_request(
+            "POST",
+            POKE_ENDPOINT,
+            payload,
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=30,
+        )
+    except IntegrationError as e:
+        if "HTTP 401" in str(e):
+            raise IntegrationError(
+                "Poke rejected the API key (401). Create a V2 key in Poke Kitchen → API Keys; "
+                "legacy pk_ keys from Settings → Advanced only work with Poke's deprecated V1 endpoint."
+            ) from e
+        raise
+    if res.get("success") is False:
+        raise IntegrationError(str(res.get("message") or "Poke did not accept the message."))
+    return res
+
+
+def normalize_poke_api_key(api_key: str) -> str:
+    key = (api_key or "").strip().strip('"\'')
+    if key.lower().startswith("bearer "):
+        key = key.split(None, 1)[1].strip()
+    if not key:
+        raise IntegrationError("Missing Poke API key. Create a V2 key in Poke Kitchen → API Keys.")
+    if key.startswith("pk_"):
+        raise IntegrationError(
+            "That looks like a legacy Poke V1 key (pk_...). The current Poke API endpoint requires a V2 key "
+            "created at poke.com/kitchen → API Keys."
+        )
+    return key
+
+
+def build_poke_message(summary: str, compact: dict) -> str:
+    return (
+        "Please ingest this NoiseFit watch update into my health/fitness context.\n\n"
+        f"Summary: {summary}\n\n"
+        "What to do:\n"
+        "- Record these as my latest wearable metrics for trend/history context.\n"
+        "- Use them when I ask about sleep, recovery, steps, cardio, SpO₂, or stress.\n"
+        "- Do not treat this as medical advice; just summarize and remember the telemetry.\n\n"
+        "Compact fitness digest:\n"
+        f"```json\n{json.dumps(compact, indent=2, sort_keys=True)}\n```"
     )
+
+
+def compact_health_day(data: dict) -> dict:
+    steps = data.get("steps") or {}
+    heart = data.get("heart") or {}
+    sleep = data.get("sleep") or {}
+    spo2 = data.get("spo2") or {}
+    stress = data.get("stress") or {}
+
+    def count_series(obj: dict) -> int:
+        return len(obj.get("series") or []) if isinstance(obj, dict) else 0
+
+    return {
+        "timestamp": data.get("ts"),
+        "battery": data.get("battery"),
+        "steps": {
+            "today_steps": steps.get("today_steps"),
+            "total": steps.get("total"),
+            "distance_m": steps.get("distance_m"),
+            "calories": steps.get("calories"),
+            "sample_count": count_series(steps),
+        },
+        "heart_rate": {
+            "latest_bpm": heart.get("latest"),
+            "resting_bpm": heart.get("resting"),
+            "min_bpm": heart.get("min"),
+            "max_bpm": heart.get("max"),
+            "sample_count": count_series(heart),
+        },
+        "sleep": {
+            "start": sleep.get("start"),
+            "end": sleep.get("end"),
+            "duration_min": sleep.get("duration"),
+            "duration_label": sleep.get("duration_label"),
+            "score": sleep.get("score"),
+            "deep_min": sleep.get("deep_min"),
+            "light_min": sleep.get("light_min"),
+            "rem_min": sleep.get("rem_min"),
+            "awake_min": sleep.get("awake_min"),
+            "stage_count": len(sleep.get("stages") or []) if isinstance(sleep, dict) else 0,
+        },
+        "spo2": {
+            "latest_pct": spo2.get("latest"),
+            "avg_pct": spo2.get("avg"),
+            "min_pct": spo2.get("min"),
+            "max_pct": spo2.get("max"),
+            "sample_count": count_series(spo2),
+        },
+        "stress": {
+            "latest": stress.get("latest"),
+            "avg": stress.get("avg"),
+            "min": stress.get("min"),
+            "max": stress.get("max"),
+            "sample_count": count_series(stress),
+        },
+    }
 
 
 def summarize_health_day(data: dict) -> str:

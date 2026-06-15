@@ -49,6 +49,7 @@ from noise_sync import (  # noqa: E402
     decode_hr,
     decode_sleep,
     decode_offline_measure,
+    pb_get,
 )
 
 
@@ -140,6 +141,354 @@ def _series_points(values, freq_min: int):
     return out
 
 
+def _epoch_seconds(value) -> Optional[int]:
+    try:
+        n = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    if n <= 0:
+        return None
+    if n > 10_000_000_000:  # tolerate milliseconds
+        n //= 1000
+    return n
+
+
+def _time_label(value) -> Optional[str]:
+    ts = _epoch_seconds(value)
+    if not ts:
+        return None
+    return datetime.datetime.fromtimestamp(ts).strftime("%H:%M")
+
+
+def _duration_label(minutes) -> Optional[str]:
+    try:
+        m = int(minutes)
+    except (TypeError, ValueError):
+        return None
+    if m <= 0:
+        return None
+    return f"{m // 60}h {m % 60}m"
+
+
+def _decode_legacy_stage_hex(value) -> Optional[dict]:
+    """Recover cached stages from the old decoder.
+
+    Older app builds stored the nested protobuf stage bytes as a hex string in
+    `stage.start`.  Decode that shape so saved data immediately becomes useful,
+    even before the next watch refresh.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        raw = bytes.fromhex(value)
+    except ValueError:
+        return None
+    start = pb_get(raw, 1)
+    duration = pb_get(raw, 2)
+    raw_type = pb_get(raw, 3)
+    if not isinstance(start, int) or not isinstance(duration, int) or not isinstance(raw_type, int):
+        return None
+    return {
+        "start": start,
+        "duration": duration,
+        "type": {0: "awake", 1: "light", 2: "deep", 3: "rem"}.get(raw_type, "?"),
+    }
+
+
+def _normalize_sleep(d: dict) -> dict:
+    if not d:
+        return {}
+    out = dict(d)
+    start = _epoch_seconds(out.get("start"))
+    end = _epoch_seconds(out.get("end"))
+    duration = out.get("duration")
+    try:
+        duration = int(duration) if duration is not None else None
+    except (TypeError, ValueError):
+        duration = None
+    if (not duration or duration <= 0) and start and end and end > start:
+        duration = round((end - start) / 60)
+    out["start"] = start or out.get("start")
+    out["end"] = end or out.get("end")
+    out["duration"] = duration
+    out["start_label"] = _time_label(start)
+    out["end_label"] = _time_label(end)
+    out["duration_label"] = _duration_label(duration)
+
+    stages = []
+    for st in out.get("stages") or []:
+        if not isinstance(st, dict):
+            continue
+        repaired = _decode_legacy_stage_hex(st.get("start")) or dict(st)
+        try:
+            dur = int(repaired.get("duration") or 0)
+        except (TypeError, ValueError):
+            continue
+        if dur <= 0:
+            continue
+        typ = str(repaired.get("type") or "?").lower()
+        if typ not in ("awake", "light", "deep", "rem"):
+            typ = "unknown"
+        st_start = _epoch_seconds(repaired.get("start"))
+        stages.append({"start": st_start, "duration": dur, "type": typ})
+    stages.sort(key=lambda x: x.get("start") or 0)
+    cursor = start
+    normalized_stages = []
+    for st in stages:
+        dur = int(st.get("duration") or 0)
+        st_start = st.get("start") or cursor
+        st_end = st_start + dur * 60 if st_start else None
+        if st_end:
+            cursor = st_end
+        normalized_stages.append({
+            "start": st_start,
+            "end": st_end,
+            "start_label": _time_label(st_start),
+            "end_label": _time_label(st_end),
+            "duration": dur,
+            "duration_label": _duration_label(dur),
+            "type": st.get("type"),
+        })
+    out["stages"] = normalized_stages
+
+    totals = {}
+    for typ in ("awake", "light", "deep", "rem"):
+        direct = out.get(f"{typ}_min")
+        try:
+            val = int(direct) if direct is not None else None
+        except (TypeError, ValueError):
+            val = None
+        if val is None:
+            val = sum(int(s.get("duration") or 0) for s in normalized_stages if s.get("type") == typ) or None
+        totals[typ] = val
+        out[f"{typ}_min"] = val
+
+    # Some firmware exposes REM only through the distribution list.  If the
+    # field is absent but total duration and the other totals are coherent, use
+    # the remaining minutes as REM so stage totals match the watch's sleep block.
+    # Only do this when the gap is physiologically plausible: a large gap means
+    # the watch over-counted the sleep window (e.g. missed wake-detection), not
+    # that the night was mostly REM, so leave REM unknown rather than fabricate
+    # hours of it.
+    known_without_rem = sum(v or 0 for k, v in totals.items() if k != "rem")
+    if (out.get("rem_min") is None or out.get("rem_min") == 0) and duration and known_without_rem < duration:
+        gap = duration - known_without_rem
+        if gap <= duration * 0.5:
+            rem = min(gap, round(duration * 0.35))
+            if rem > 0:
+                out["rem_min"] = rem
+                out["rem_estimated"] = True
+                totals["rem"] = rem
+
+    exact_stage_total = sum(int(s.get("duration") or 0) for s in normalized_stages)
+    total_stage_mix = sum(v or 0 for v in totals.values())
+    out["stage_total_min"] = exact_stage_total or total_stage_mix
+    out["stage_coverage_pct"] = round((exact_stage_total / duration) * 100) if duration and exact_stage_total else 0
+    out["stages_partial"] = bool(duration and exact_stage_total and exact_stage_total < duration * 0.8)
+    out["timeline_quality"] = (
+        "exact" if duration and exact_stage_total >= duration * 0.8
+        else "partial" if exact_stage_total
+        else "totals"
+    )
+    out["validation_notes"] = []
+    if start and end and duration and abs(round((end - start) / 60) - duration) > 2:
+        out["validation_notes"].append("watch duration differs from start/end window")
+    if duration and total_stage_mix and abs(total_stage_mix - duration) > 2:
+        out["validation_notes"].append("stage totals do not add up to total duration")
+    if out["timeline_quality"] == "partial":
+        out["validation_notes"].append("exact stage transitions are partial; refresh from watch for the full graph")
+    elif out["timeline_quality"] == "totals":
+        out["validation_notes"].append("exact stage transitions unavailable; showing stage totals")
+    return out
+
+
+# ── Healthspan / biological age ──────────────────────────────────────────────
+# A WHOOP-style "effective age" model. Each measured metric has an expert
+# reference value for *good health* (the break-even point, not a population
+# average). Deviations are converted to year-deltas via the Gompertz law of
+# mortality: all-cause mortality rises ~10% per year of adult age, so any factor
+# that shifts mortality ~10% is worth ≈ 1 year. Component deltas are summed onto
+# chronological age. We only use signals this hardware actually measures —
+# resting HR, sleep duration, sleep consistency, steps, and stress — so there is
+# no VO2max/lean-mass estimation. It is a lifestyle estimate, not a clinical one.
+
+HEALTHSPAN_MIN_DAYS = 14            # ~1-2 weeks before the number is meaningful
+HEALTHSPAN_PACE_WINDOW = 30         # short-term window for Pace of Aging
+
+
+def _hs_clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def _hs_num(v):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f == f else None  # reject NaN
+
+
+def _hs_mean(values):
+    vals = [x for x in (_hs_num(v) for v in values) if x is not None]
+    return sum(vals) / len(vals) if vals else None
+
+
+def _hs_stdev(values):
+    vals = [x for x in (_hs_num(v) for v in values) if x is not None]
+    if len(vals) < 2:
+        return None
+    m = sum(vals) / len(vals)
+    return (sum((x - m) ** 2 for x in vals) / (len(vals) - 1)) ** 0.5
+
+
+def _sleep_onset_minutes(sleep: dict):
+    """Minute-of-day a night's sleep began, folded so late nights sort sensibly
+    (02:00 -> 26*60). Used to measure bed-time consistency across nights."""
+    start = _epoch_seconds(sleep.get("start"))
+    if not start:
+        return None
+    dt = datetime.datetime.fromtimestamp(start)
+    mins = dt.hour * 60 + dt.minute
+    if mins < 12 * 60:           # after-midnight onset: continue past 24h
+        mins += 24 * 60
+    return mins
+
+
+def _valid_hs_records(records: dict):
+    """Day records that carry a real sleep block, oldest-first."""
+    out = []
+    for day, rec in (records or {}).items():
+        rec = rec or {}
+        sleep = rec.get("sleep") or {}
+        if _hs_num(sleep.get("duration")):
+            out.append((day, rec))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def _hs_component(metric, label, value, reference, per_unit_years, unit,
+                  higher_is_younger, clamp_years, note=""):
+    """Build one component. *per_unit_years* is years added per unit the value
+    sits on the 'older' side of the reference. direction/sign follow
+    higher_is_younger."""
+    if value is None:
+        return {"metric": metric, "label": label, "value": None,
+                "reference": reference, "unit": unit, "year_delta": 0.0,
+                "available": False, "note": note}
+    gap = (reference - value) if higher_is_younger else (value - reference)
+    # gap > 0 means worse-than-reference -> older (+years)
+    year_delta = _hs_clamp(gap * per_unit_years, -clamp_years, clamp_years)
+    return {"metric": metric, "label": label, "value": round(value, 1),
+            "reference": reference, "unit": unit,
+            "year_delta": round(year_delta, 2), "available": True, "note": note}
+
+
+def compute_healthspan(records: dict, profile: Optional[dict]) -> dict:
+    """WHOOP-style biological-age estimate from measured day records.
+
+    Returns chronological_age, whoop_age, pace_of_aging and a per-metric
+    component breakdown, plus a `ready` flag once enough days exist.
+    """
+    profile = profile or {}
+    birth_year = None
+    try:
+        birth_year = int(profile.get("birth_year")) if profile.get("birth_year") else None
+    except (TypeError, ValueError):
+        birth_year = None
+    sex = str(profile.get("sex") or "").lower()[:1]   # 'm' / 'f' / ''
+
+    valid = _valid_hs_records(records)
+    days_have = len(valid)
+    result = {
+        "has_profile": bool(birth_year),
+        "ready": False,
+        "days_have": days_have,
+        "days_needed": HEALTHSPAN_MIN_DAYS,
+        "chronological_age": None,
+        "whoop_age": None,
+        "pace_of_aging": None,
+        "components": [],
+        "note": "Lifestyle estimate from measured sleep, activity, resting heart rate and stress — not a clinical measure.",
+    }
+    if not birth_year:
+        return result
+    chrono = datetime.date.today().year - birth_year
+    result["chronological_age"] = chrono
+    if days_have < HEALTHSPAN_MIN_DAYS:
+        return result
+
+    def window(recs):
+        sleeps = [r["sleep"] for _, r in recs if isinstance(r.get("sleep"), dict)]
+        durations = [s.get("duration") for s in sleeps]
+        onsets = [_sleep_onset_minutes(s) for s in sleeps]
+        resting = [(_r.get("heart") or {}).get("resting") for _, _r in recs]
+        steps = [(_r.get("steps") or {}).get("today_steps")
+                 or (_r.get("steps") or {}).get("total") for _, _r in recs]
+        stress = [(_r.get("stress") or {}).get("avg")
+                  or (_r.get("stress") or {}).get("latest") for _, _r in recs]
+        return {
+            "sleep_dur": _hs_mean(durations),
+            "consistency": _hs_stdev([o for o in onsets if o is not None]),
+            "resting": _hs_mean(resting),
+            "steps": _hs_mean(steps),
+            "stress": _hs_mean(stress),
+        }
+
+    # Sex-adjusted resting-HR reference (good adult RHR; women run a few bpm higher).
+    rhr_ref = 60.0 if sex == "f" else 58.0
+    agg = window(valid)
+
+    # Reference values + Gompertz-anchored slopes (years per unit on the older side).
+    components = [
+        # Resting HR: +10 bpm ≈ +9% mortality ≈ ~1 yr  -> 0.1 yr/bpm.
+        _hs_component("resting_hr", "Resting heart rate", agg["resting"], rhr_ref,
+                      0.10, "bpm", higher_is_younger=False, clamp_years=6,
+                      note="+10 bpm ≈ +1 year"),
+        # Sleep duration: reference 7.5h (450 min); ~1 yr per 90 min short.
+        _hs_component("sleep_duration", "Sleep duration", agg["sleep_dur"], 450.0,
+                      1.0 / 90.0, "min", higher_is_younger=True, clamp_years=4,
+                      note="reference 7.5 h"),
+        # Sleep consistency: stdev of onset; reference 30 min, ~1 yr per extra 45 min.
+        _hs_component("sleep_consistency", "Sleep consistency", agg["consistency"], 30.0,
+                      1.0 / 45.0, "min σ", higher_is_younger=False, clamp_years=3,
+                      note="steadier bedtime is younger"),
+        # Steps: reference 8000/day; ~1 yr per 3500 steps short.
+        _hs_component("steps", "Daily steps", agg["steps"], 8000.0,
+                      1.0 / 3500.0, "steps", higher_is_younger=True, clamp_years=4,
+                      note="reference ~8,000/day"),
+        # Stress: reference 40 (0-100 watch scale); ~1 yr per 25 points above.
+        _hs_component("stress", "Stress load", agg["stress"], 40.0,
+                      1.0 / 25.0, "", higher_is_younger=False, clamp_years=2.5,
+                      note="lower daily stress is younger"),
+    ]
+    total_delta = sum(c["year_delta"] for c in components if c["available"])
+    whoop_age = _hs_clamp(chrono + total_delta, 18, 95)
+
+    # Pace of Aging: project the last 30 days against the full baseline.
+    recent = valid[-HEALTHSPAN_PACE_WINDOW:]
+    recent_agg = window(recent)
+    recent_components = [
+        _hs_component("resting_hr", "", recent_agg["resting"], rhr_ref, 0.10, "", False, 6),
+        _hs_component("sleep_duration", "", recent_agg["sleep_dur"], 450.0, 1.0 / 90.0, "", True, 4),
+        _hs_component("sleep_consistency", "", recent_agg["consistency"], 30.0, 1.0 / 45.0, "", False, 3),
+        _hs_component("steps", "", recent_agg["steps"], 8000.0, 1.0 / 3500.0, "", True, 4),
+        _hs_component("stress", "", recent_agg["stress"], 40.0, 1.0 / 25.0, "", False, 2.5),
+    ]
+    recent_delta = sum(c["year_delta"] for c in recent_components if c["available"])
+    # Pace 1.0 == aging at chronological rate. Map recent year-burden to a pace:
+    # a neutral profile (delta 0) holds steady. Scale so +5 yr burden ≈ 2x pace.
+    pace = _hs_clamp(1.0 + recent_delta / 5.0, -1.0, 3.0)
+
+    result.update({
+        "ready": True,
+        "whoop_age": round(whoop_age, 1),
+        "age_delta": round(whoop_age - chrono, 1),
+        "pace_of_aging": round(pace, 2),
+        "components": sorted(components, key=lambda c: -abs(c["year_delta"])),
+    })
+    return result
+
+
 class WatchService:
     """Background-loop owner. All public methods return concurrent futures."""
 
@@ -186,15 +535,76 @@ class WatchService:
         self._remember()
 
     def memory(self) -> dict:
-        return _jsonable(dict(self._memory))
+        mem = dict(self._memory)
+        if isinstance(mem.get("last_data"), dict) and isinstance(mem["last_data"].get("sleep"), dict):
+            mem["last_data"] = dict(mem["last_data"])
+            mem["last_data"]["sleep"] = _normalize_sleep(mem["last_data"].get("sleep") or {})
+        records = {}
+        for day, rec in (mem.get("records") or {}).items():
+            rec = dict(rec or {})
+            if isinstance(rec.get("sleep"), dict):
+                rec["sleep"] = _normalize_sleep(rec.get("sleep") or {})
+            records[day] = rec
+        mem["records"] = records
+        return _jsonable(mem)
 
     def records(self) -> dict:
-        return _jsonable(dict(self._memory.get("records") or {}))
+        return _jsonable((self.memory().get("records") or {}))
+
+    # ── profile + healthspan ───────────────────────────────────────────────
+    def get_profile(self) -> dict:
+        return _jsonable(self._memory.get("profile") or {})
+
+    def save_profile(self, birth_year, sex, height_cm=None, weight_kg=None) -> dict:
+        try:
+            by = int(birth_year)
+        except (TypeError, ValueError):
+            return {"error": "Enter a valid birth year."}
+        this_year = datetime.date.today().year
+        if by < 1900 or by > this_year - 13:
+            return {"error": "Enter a realistic birth year."}
+        profile = {"birth_year": by, "sex": (str(sex or "").lower()[:1] or None)}
+        for key, raw in (("height_cm", height_cm), ("weight_kg", weight_kg)):
+            try:
+                profile[key] = round(float(raw), 1) if raw not in (None, "") else None
+            except (TypeError, ValueError):
+                profile[key] = None
+        self._remember(profile=profile)
+        return {"ok": True, "profile": _jsonable(profile)}
+
+    def healthspan(self) -> dict:
+        records = (self.memory().get("records") or {})
+        return _jsonable(compute_healthspan(records, self._memory.get("profile")))
+
+    def _cached_metric(self, key: str, ts: Optional[str] = None):
+        day = _day_key(ts)
+        rec = (self._memory.get("records") or {}).get(day) or {}
+        val = rec.get(key)
+        if isinstance(val, dict) and val:
+            out = dict(val)
+            out["cached"] = True
+            return out
+        return None
 
     def _remember_record(self, data: dict):
         data = _jsonable(data)
+        for value in data.values():
+            if isinstance(value, dict):
+                value.pop("cached", None)
+                value.pop("cache_note", None)
         day = _day_key(data.get("ts"))
         records = dict(self._memory.get("records") or {})
+        existing = dict(records.get(day) or {})
+        if existing:
+            merged = dict(existing)
+            for key, value in data.items():
+                if key == "sleep" and isinstance(value, dict) and not value:
+                    # Never let an empty refresh erase the last good sleep block.
+                    continue
+                if value is None or value == {}:
+                    continue
+                merged[key] = value
+            data = merged
         records[day] = data
         self._remember(last_data=data, records=records)
 
@@ -338,7 +748,7 @@ class WatchService:
         return {"ok": True, "connected": True, "info": info}
 
     # ── public API (called from the JS bridge) ──────────────────────────────
-    async def scan(self, timeout: float = 8.0) -> list:
+    async def scan(self, timeout: float = 10.0) -> list:
         """Discover nearby NoiseFit watches. Returns [{name, address}].
 
         Delegates to noise_sync.scan_watches (early-exit, matches by name or the
@@ -381,9 +791,9 @@ class WatchService:
         device = self._scan_cache.get(address)
         if device is None:
             self._emit("status", {"state": "connecting", "address": address})
-            device = await find_ble_device(address, timeout=8.0, log=self._log)
+            device = await find_ble_device(address, timeout=float(os.environ.get("NOISE_SCAN_TIMEOUT", 14.0)), log=self._log)
             if device is None:
-                raise RuntimeError("Couldn't find that watch nearby. Tap its screen and rescan.")
+                raise RuntimeError("Couldn't find the watch. Wake it, keep it close, disconnect it from the phone app, then press Scan for watch.")
         address = getattr(device, "address", None) or address
         self.watch = NoiseTwist(address, self.token, log=self._log, ble_device=device)
         self._emit("status", {"state": "connecting", "address": address})
@@ -474,11 +884,18 @@ class WatchService:
         for key, label, fn in (
             ("steps", "steps", self._steps),
             ("heart", "heart rate", self._heart),
-            ("sleep", "sleep", self._sleep),
             ("spo2", "SpO2", self._spo2),
             ("stress", "stress", self._stress),
+            ("sleep", "sleep", self._sleep),
         ):
-            data[key] = _jsonable(await self._safe(label, fn))
+            value = _jsonable(await self._safe(label, fn))
+            if (value is None or value == {}) and key == "sleep":
+                cached = self._cached_metric(key, data.get("ts"))
+                if cached:
+                    cached["cache_note"] = "watch did not return sleep on this refresh; showing saved sleep"
+                    value = cached
+                    self._log("sleep unavailable from watch; keeping saved sleep data")
+            data[key] = value
             self._emit("data", _jsonable(dict(data)))
 
         data = _jsonable(data)
@@ -522,10 +939,10 @@ class WatchService:
         }
 
     async def _sleep(self) -> dict:
-        d = await self.watch._pull_fitness(FT_SLEEP, decode_sleep, "SLEEP")
+        d = await self.watch._pull_fitness(FT_SLEEP, decode_sleep, "SLEEP", confirm=False)
         if not d or not d.get("start"):
             return {}
-        return {
+        return _normalize_sleep({
             "start": d.get("start"),
             "end": d.get("end"),
             "duration": d.get("duration"),
@@ -533,8 +950,9 @@ class WatchService:
             "deep_min": d.get("deep_min"),
             "light_min": d.get("light_min"),
             "awake_min": d.get("awake_min"),
+            "rem_min": d.get("rem_min"),
             "stages": d.get("stages") or [],
-        }
+        })
 
     async def _spo2(self) -> dict:
         ms = await self.watch._pull_fitness(

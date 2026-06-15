@@ -150,6 +150,15 @@ class Bridge:
     def records(self):
         return _jsonable(self.service.records())
 
+    def get_profile(self):
+        return _jsonable(self.service.get_profile())
+
+    def save_profile(self, birth_year, sex, height_cm=None, weight_kg=None):
+        return _jsonable(self.service.save_profile(birth_year, sex, height_cm, weight_kg))
+
+    def healthspan(self):
+        return _jsonable(self.service.healthspan())
+
     def ensure_connected(self):
         return self._call(self.service.ensure_connected())
 
