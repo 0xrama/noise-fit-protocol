@@ -44,10 +44,14 @@ from noise_sync import (  # noqa: E402
     FT_SLEEP,
     FT_SPO2,
     FT_STRESS,
+    FT_STANDING,
+    FT_ACTIVITY,
     OFFLINE_FITNESS_FIELD,
     decode_daily,
     decode_hr,
     decode_sleep,
+    decode_standing,
+    decode_activity,
     decode_offline_measure,
     decode_setime,
     pb_get,
@@ -314,8 +318,8 @@ def _normalize_sleep(d: dict) -> dict:
 # mortality: all-cause mortality rises ~10% per year of adult age, so any factor
 # that shifts mortality ~10% is worth ≈ 1 year. Component deltas are summed onto
 # chronological age. We only use signals this hardware actually measures —
-# resting HR, sleep duration, sleep consistency, steps, and stress — so there is
-# no VO2max/lean-mass estimation. It is a lifestyle estimate, not a clinical one.
+# resting HR, sleep duration, sleep consistency, steps, active hours, and stress —
+# so there is no VO2max/lean-mass estimation. It is a lifestyle estimate, not a clinical one.
 
 HEALTHSPAN_MIN_DAYS = 14            # ~1-2 weeks before the number is meaningful
 HEALTHSPAN_PACE_WINDOW = 30         # short-term window for Pace of Aging
@@ -413,7 +417,7 @@ def compute_healthspan(records: dict, profile: Optional[dict]) -> dict:
         "whoop_age": None,
         "pace_of_aging": None,
         "components": [],
-        "note": "Lifestyle estimate from measured sleep, activity, resting heart rate and stress — not a clinical measure.",
+        "note": "Lifestyle estimate from measured sleep, activity, active hours, resting heart rate and stress — not a clinical measure.",
     }
     if not birth_year:
         return result
@@ -429,6 +433,7 @@ def compute_healthspan(records: dict, profile: Optional[dict]) -> dict:
         resting = [(_r.get("heart") or {}).get("resting") for _, _r in recs]
         steps = [(_r.get("steps") or {}).get("today_steps")
                  or (_r.get("steps") or {}).get("total") for _, _r in recs]
+        standing = [(_r.get("standing") or {}).get("active_hours") for _, _r in recs]
         stress = [(_r.get("stress") or {}).get("avg")
                   or (_r.get("stress") or {}).get("latest") for _, _r in recs]
         return {
@@ -436,6 +441,7 @@ def compute_healthspan(records: dict, profile: Optional[dict]) -> dict:
             "consistency": _hs_stdev([o for o in onsets if o is not None]),
             "resting": _hs_mean(resting),
             "steps": _hs_mean(steps),
+            "standing": _hs_mean(standing),
             "stress": _hs_mean(stress),
         }
 
@@ -461,6 +467,10 @@ def compute_healthspan(records: dict, profile: Optional[dict]) -> dict:
         _hs_component("steps", "Daily steps", agg["steps"], 8000.0,
                       1.0 / 3500.0, "steps", higher_is_younger=True, clamp_years=4,
                       note="reference ~8,000/day"),
+        # Active hours: reference 12/day; ~1 yr per 4 active hours short.
+        _hs_component("standing", "Active hours", agg["standing"], 12.0,
+                      1.0 / 4.0, "h", higher_is_younger=True, clamp_years=3,
+                      note="less sedentary time is younger"),
         # Stress: reference 40 (0-100 watch scale); ~1 yr per 25 points above.
         _hs_component("stress", "Stress load", agg["stress"], 40.0,
                       1.0 / 25.0, "", higher_is_younger=False, clamp_years=2.5,
@@ -477,6 +487,7 @@ def compute_healthspan(records: dict, profile: Optional[dict]) -> dict:
         _hs_component("sleep_duration", "", recent_agg["sleep_dur"], 450.0, 1.0 / 90.0, "", True, 4),
         _hs_component("sleep_consistency", "", recent_agg["consistency"], 30.0, 1.0 / 45.0, "", False, 3),
         _hs_component("steps", "", recent_agg["steps"], 8000.0, 1.0 / 3500.0, "", True, 4),
+        _hs_component("standing", "", recent_agg["standing"], 12.0, 1.0 / 4.0, "", True, 3),
         _hs_component("stress", "", recent_agg["stress"], 40.0, 1.0 / 25.0, "", False, 2.5),
     ]
     recent_delta = sum(c["year_delta"] for c in recent_components if c["available"])
@@ -910,6 +921,8 @@ class WatchService:
         for key, label, fn in (
             ("steps", "steps", self._steps),
             ("heart", "heart rate", self._heart),
+            ("standing", "standing hours", self._standing),
+            ("activity", "activity duration", self._activity),
             ("spo2", "SpO2", self._spo2),
             ("stress", "stress", self._stress),
             ("sleep", "sleep", self._sleep),
@@ -981,6 +994,14 @@ class WatchService:
             "stages": d.get("stages") or [],
         })
 
+    async def _standing(self) -> dict:
+        d = await self.watch._pull_fitness(FT_STANDING, decode_standing, "STANDING")
+        return self._hourly_flags(d, "hour")
+
+    async def _activity(self) -> dict:
+        d = await self.watch._pull_fitness(FT_ACTIVITY, decode_activity, "ACTIVITY_DURATION")
+        return self._hourly_counts(d, "min")
+
     async def _spo2(self) -> dict:
         ms = await self.watch._pull_fitness(
             FT_SPO2,
@@ -996,6 +1017,38 @@ class WatchService:
             "STRESS",
         )
         return self._measures(ms, "")
+
+    def _hourly_flags(self, d, unit: str) -> dict:
+        if not d:
+            return {}
+        freq = d.get("freq_min") or 60
+        samples = [int(v) for v in (d.get("samples") or [])]
+        pts = _series_points(samples, freq, getattr(self, "_series_base", None))
+        active = [p for p in pts if p["v"] > 0]
+        return {
+            "active_hours": len(active),
+            "total_hours": len(samples),
+            "freq_min": freq,
+            "unit": unit,
+            "series": pts,
+        }
+
+    def _hourly_counts(self, d, unit: str) -> dict:
+        if not d:
+            return {}
+        freq = d.get("freq_min") or 60
+        samples = [int(v) for v in (d.get("samples") or [])]
+        pts = _series_points(samples, freq, getattr(self, "_series_base", None))
+        active = [p for p in pts if p["v"] > 0]
+        vals = [p["v"] for p in active]
+        return {
+            "total": sum(samples),
+            "active_buckets": len(active),
+            "max": max(vals) if vals else 0,
+            "freq_min": freq,
+            "unit": unit,
+            "series": pts,
+        }
 
     @staticmethod
     def _measures(ms, unit: str) -> dict:

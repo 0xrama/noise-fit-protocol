@@ -76,6 +76,8 @@ function humanizeLog(line) {
     [/HEART_RATE|\bhr\b/i, "Reading heart rate…"],
     [/SLEEP/i, "Reading sleep…"],
     [/SpO2/i, "Reading blood oxygen…"],
+    [/STANDING/i, "Reading active hours…"],
+    [/ACTIVITY_DURATION/i, "Reading activity duration…"],
     [/STRESS/i, "Reading stress…"],
     [/battery/i, "Reading battery…"],
     [/VERIFY|bring-up|Authenticated/i, "Authenticating…"],
@@ -388,7 +390,11 @@ function render(data) {
   if (!data) return;
   rememberDayRecord(data);
   if (data.battery != null) setBattery(data.battery);
-  if ("steps" in data) { renderSteps(data.steps || {}); renderActivity(data.steps || {}); doneCard("card-steps"); doneCard("card-activity"); }
+  if ("steps" in data || "standing" in data || "activity" in data) {
+    renderActivity(data.steps || {}, data.standing || {}, data.activity || {});
+    if ("steps" in data) { renderSteps(data.steps || {}); doneCard("card-steps"); }
+    doneCard("card-activity");
+  }
   if ("heart" in data) { renderHeart(data.heart || {}); doneCard("card-hr"); }
   if ("sleep" in data) { renderSleep(data.sleep || {}); doneCard("card-sleep"); }
   if ("spo2" in data) { renderSpo2(data.spo2 || {}); doneCard("card-spo2"); }
@@ -423,7 +429,7 @@ function dayLabel(key) {
 }
 
 function rememberDayRecord(data) {
-  if (!data || !data.ts || !("steps" in data || "heart" in data || "sleep" in data || "spo2" in data || "stress" in data)) return;
+  if (!data || !data.ts || !("steps" in data || "heart" in data || "sleep" in data || "spo2" in data || "stress" in data || "standing" in data || "activity" in data)) return;
   dayRecords[dayKey(data.ts)] = { ...(dayRecords[dayKey(data.ts)] || {}), ...data };
   updateDayPicker(dayKey(data.ts));
   if (typeof renderWellness === "function") renderWellness(dayRecords);

@@ -291,13 +291,17 @@ function renderStepsPage(records, selectedDay) {
 
 /* ── Activity page ──────────────────────────────────────────────────────────── */
 function renderActivityPage(records, selectedDay) {
-  const sel = (records[selectedDay] && records[selectedDay].steps) || latestMetric(records, "steps");
+  const selected = records[selectedDay] || {};
+  const sel = selected.steps || latestMetric(records, "steps");
+  const standing = selected.standing || latestMetric(records, "standing");
+  const activity = selected.activity || latestMetric(records, "activity");
   const dist = sel && sel.distance_m;
   $("ac-dist").textContent = dist == null ? "—" : dist >= 1000 ? (dist / 1000).toFixed(2) + " km" : dist + " m";
   $("ac-hero-stats").innerHTML =
     heroStat("calories", sel && sel.calories != null ? fmt(sel.calories) : "—", "kcal") +
-    heroStat("steps", sel ? fmt(sel.today_steps != null ? sel.today_steps : sel.total) : "—") +
-    heroStat("days tracked", dayTrend(records, "steps.total").length || dayTrend(records, "steps.today_steps").length);
+    heroStat("active hours", standing && standing.active_hours != null ? `${standing.active_hours}/${standing.total_hours || 24}` : "—") +
+    heroStat("activity duration", activity && activity.total != null ? fmt(activity.total) : "—", activity && activity.unit ? activity.unit : "units") +
+    heroStat("steps", sel ? fmt(sel.today_steps != null ? sel.today_steps : sel.total) : "—");
 
   const calPts = dayTrend(records, "steps.calories");
   drawTrend("ac-cal-trend", calPts, { color: "var(--warn)", unit: "kcal", fill: "rgba(255,197,107,0.16)" });
@@ -308,6 +312,16 @@ function renderActivityPage(records, selectedDay) {
   drawTrend("ac-dist-trend", distPts, { color: "var(--accent-2)", unit: "km", fill: "rgba(122,162,255,0.16)" });
   const ads = trendStats(distPts);
   $("ac-dist-foot").textContent = ads ? `avg ${ads.avg.toFixed(2)} km/day` : "";
+
+  const standingPts = dayTrend(records, "standing.active_hours");
+  drawTrend("ac-standing-trend", standingPts, { color: "var(--accent)", unit: "h", fill: "rgba(95,227,232,0.14)" });
+  const shs = trendStats(standingPts);
+  $("ac-standing-foot").textContent = shs ? `avg ${shs.avg.toFixed(1)} active hours/day` : "";
+
+  const durationPts = dayTrend(records, "activity.total");
+  drawTrend("ac-duration-trend", durationPts, { color: "var(--ok)", unit: activity && activity.unit ? activity.unit : "units", fill: "rgba(87,232,166,0.14)" });
+  const ads2 = trendStats(durationPts);
+  $("ac-duration-foot").textContent = ads2 ? `avg ${Math.round(ads2.avg)} ${activity && activity.unit ? activity.unit : "units"}/day` : "";
 
   // weekly movement: sum steps into ISO-ish weeks (group by 7-day chunks).
   renderWeekly("ac-weekly", records);

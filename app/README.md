@@ -13,8 +13,8 @@ today's health data at a glance. Built on the reverse-engineered protocol in
 ```
 
 Then: **Scan for watch** (or type the MAC, e.g. `14:55:b9:5a:c9:fa`) → connect.
-The dashboard pulls battery, steps, heart rate, sleep, SpO₂, and stress. Sleep
-shows a quality score from the watch when available, with a stage-based fallback.
+The dashboard pulls battery, steps, heart rate, sleep, SpO₂, stress, active hours,
+and activity-duration buckets. Sleep shows a quality score from the watch when available, with a stage-based fallback.
 Recovery and biological-age trend cards unlock after 20 valid sleep-history days.
 **Refresh** re-syncs, **Sync time** fixes the watch clock. The sidebar also has
 **Sync to Google Fit** and **Send data to Poke** actions for the latest cached
@@ -53,9 +53,9 @@ watch data.
 - Google Fit receives steps, heart-rate samples, sleep stages/sessions, and SpO₂
   readings. Stress is not uploaded to visible Google Fit history because Google
   Fit has no standard stress data type.
-- Poke sync posts the latest health payload to
-  `https://poke.com/api/v1/inbound/api-message` using a V2 API key from Poke
-  Kitchen → API Keys. Put it in `.env.local` as `POKE_API_KEY=...`.
+- Poke sync posts the latest health payload, including active hours and activity
+  duration, to `https://poke.com/api/v1/inbound/api-message` using a V2 API key
+  from Poke Kitchen → API Keys. Put it in `.env.local` as `POKE_API_KEY=...`.
 
 Copy `.env.local.example` to `.env.local` to get started. Shell environment
 variables still override saved in-app settings.

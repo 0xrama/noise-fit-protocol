@@ -490,11 +490,18 @@ function renderStress(s) {
   $("stress-foot").textContent = `${label}  ·  avg ${s.avg}`;
 }
 
-function renderActivity(s) {
-  if (!s) return;
+function renderActivity(s, standing, activity) {
+  if (!s) s = {};
+  standing = standing || {};
+  activity = activity || {};
   const dist = s.distance_m;
   $("act-dist").textContent = dist == null ? "—" : dist >= 1000 ? (dist / 1000).toFixed(2) + " km" : dist + " m";
   $("act-cal").textContent = s.calories == null ? "—" : fmt(s.calories) + " kcal";
+  const activeHours = standing.active_hours;
+  const totalHours = standing.total_hours;
+  $("act-standing").textContent = activeHours == null ? "—" : `${activeHours}/${totalHours || 24}`;
+  const duration = activity.total;
+  $("act-duration").textContent = duration == null ? "—" : `${fmt(duration)} ${activity.unit || "units"}`;
 }
 
 /* ── wire up controls once DOM + bridge are ready ────────────────────────── */

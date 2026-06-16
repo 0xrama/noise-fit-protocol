@@ -481,7 +481,7 @@ def build_poke_message(summary: str, compact: dict) -> str:
         f"Summary: {summary}\n\n"
         "What to do:\n"
         "- Record these as my latest wearable metrics for trend/history context.\n"
-        "- Use them when I ask about sleep, recovery, steps, cardio, SpO₂, or stress.\n"
+        "- Use them when I ask about sleep, recovery, steps, cardio, SpO₂, stress, active hours, or activity duration.\n"
         "- Do not treat this as medical advice; just summarize and remember the telemetry.\n\n"
         "Compact fitness digest:\n"
         f"```json\n{json.dumps(compact, indent=2, sort_keys=True)}\n```"
@@ -494,6 +494,8 @@ def compact_health_day(data: dict) -> dict:
     sleep = data.get("sleep") or {}
     spo2 = data.get("spo2") or {}
     stress = data.get("stress") or {}
+    standing = data.get("standing") or {}
+    activity = data.get("activity") or {}
 
     def count_series(obj: dict) -> int:
         return len(obj.get("series") or []) if isinstance(obj, dict) else 0
@@ -541,6 +543,17 @@ def compact_health_day(data: dict) -> dict:
             "max": stress.get("max"),
             "sample_count": count_series(stress),
         },
+        "standing": {
+            "active_hours": standing.get("active_hours"),
+            "total_hours": standing.get("total_hours"),
+            "sample_count": count_series(standing),
+        },
+        "activity_duration": {
+            "total": activity.get("total"),
+            "unit": activity.get("unit"),
+            "active_buckets": activity.get("active_buckets"),
+            "sample_count": count_series(activity),
+        },
     }
 
 
@@ -551,6 +564,8 @@ def summarize_health_day(data: dict) -> str:
     sleep = data.get("sleep") or {}
     spo2 = data.get("spo2") or {}
     stress = data.get("stress") or {}
+    standing = data.get("standing") or {}
+    activity = data.get("activity") or {}
     if steps.get("today_steps") is not None or steps.get("total") is not None:
         bits.append(f"steps {steps.get('today_steps', steps.get('total'))}")
     if heart.get("latest") is not None:
@@ -562,5 +577,9 @@ def summarize_health_day(data: dict) -> str:
         bits.append(f"SpO2 {spo2.get('latest')}%")
     if stress.get("latest") is not None:
         bits.append(f"stress {stress.get('latest')}")
+    if standing.get("active_hours") is not None:
+        bits.append(f"active hours {standing.get('active_hours')}/{standing.get('total_hours') or 24}")
+    if activity.get("total") is not None:
+        bits.append(f"activity duration {activity.get('total')} {activity.get('unit') or 'units'}")
     when = data.get("ts") or "latest sync"
     return f"NoiseFit {when}: " + (", ".join(bits) if bits else "no metric values available")

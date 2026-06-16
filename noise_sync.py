@@ -18,6 +18,8 @@ Capabilities:
   --hr        Pull today's continuous heart-rate series (5-min buckets)
   --sleep     Pull today's sleep data
   --spo2      Pull today's blood-oxygen series
+  --standing  Pull today's standing/active-hour flags
+  --activity  Pull today's activity-duration buckets
   --all       Time + info + all health data
 
 Usage:
@@ -429,6 +431,23 @@ def decode_spo2(buf: bytes) -> dict:
     }
 
 
+def _decode_hourly_u8(buf: bytes, fitness_field: int) -> dict:
+    fitness = pb_get(buf, 9) or b""
+    hourly = pb_get(fitness, fitness_field) or b""
+    return {
+        "freq_min": pb_get(hourly, 2) or 60,
+        "samples": list(pb_get(hourly, 3) or b""),
+    }
+
+
+def decode_standing(buf: bytes) -> dict:
+    return _decode_hourly_u8(buf, 14)         # SEEffectiveStandingData
+
+
+def decode_activity(buf: bytes) -> dict:
+    return _decode_hourly_u8(buf, 15)         # SEActivityDurationData
+
+
 def decode_offline_measure(buf: bytes, fitness_field: int) -> list:
     """Decode a list of (epoch, value) spot measurements (SEMeasureData).
     SpO2 → SEFitness field 9; stress/pressure → field 11."""
@@ -730,6 +749,28 @@ class NoiseTwist:
             level = ("relaxed" if val < 40 else "normal" if val < 60 else "tense" if val < 80 else "stressed")
             self.log(f"    {when}  ->  {val}  ({level})")
 
+    async def pull_standing(self):
+        d = await self._pull_fitness(FT_STANDING, decode_standing, "STANDING")
+        if not d:
+            return
+        base = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        labels = _series_time_labels(base, d["freq_min"], len(d["samples"]))
+        active = [(t, v) for t, v in zip(labels, d["samples"]) if v]
+        self.log(f"  standing hours: {len(active)} / {len(d['samples'])}")
+        for t, v in active:
+            self.log(f"    {t:%H:%M}  active flag={v}")
+
+    async def pull_activity(self):
+        d = await self._pull_fitness(FT_ACTIVITY, decode_activity, "ACTIVITY_DURATION")
+        if not d:
+            return
+        base = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        labels = _series_time_labels(base, d["freq_min"], len(d["samples"]))
+        nz = [(t, v) for t, v in zip(labels, d["samples"]) if v]
+        self.log(f"  activity-duration buckets: {sum(d['samples'])} min across {len(nz)} active buckets")
+        for t, v in nz:
+            self.log(f"    {t:%H:%M}  {v} min")
+
 
 async def scan_watches(timeout: float = 6.0, log=print, early_exit: bool = True):
     """Scan for NoiseFit watches and return a list of BLEDevice objects.
@@ -848,13 +889,16 @@ async def main():
     ap.add_argument("--sleep", action="store_true", help="pull sleep data")
     ap.add_argument("--spo2", action="store_true", help="pull SpO2 measurements")
     ap.add_argument("--stress", action="store_true", help="pull stress measurements")
+    ap.add_argument("--standing", action="store_true", help="pull standing/active-hour flags")
+    ap.add_argument("--activity", action="store_true", help="pull activity-duration buckets")
     ap.add_argument("--all", action="store_true", help="time + info + all health")
     args = ap.parse_args()
 
     if args.all:
         args.time = args.info = args.steps = args.hr = args.sleep = args.spo2 = args.stress = True
+        args.standing = args.activity = True
     if not any([args.time, args.info, args.battery, args.steps, args.hr,
-                args.sleep, args.spo2, args.stress]):
+                args.sleep, args.spo2, args.stress, args.standing, args.activity]):
         args.info = True
 
     ble_device = await find_ble_device(args.mac, args.scan_timeout)
@@ -890,6 +934,10 @@ async def main():
             await watch.pull_spo2()
         if args.stress:
             await watch.pull_stress()
+        if args.standing:
+            await watch.pull_standing()
+        if args.activity:
+            await watch.pull_activity()
     finally:
         await watch.disconnect()
 
