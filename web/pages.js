@@ -114,7 +114,8 @@ else document.addEventListener("DOMContentLoaded", wirePages);
 /* ── Sleep page ─────────────────────────────────────────────────────────────── */
 function renderSleepPage(records, selectedDay) {
   const recs = (typeof sleepHistoryRecords === "function") ? sleepHistoryRecords(records) : [];
-  const sel = (records[selectedDay] && records[selectedDay].sleep) || (recs[0] && recs[0].sleep);
+  const hasSelectedDay = !!(selectedDay && records[selectedDay]);
+  const sel = hasSelectedDay ? records[selectedDay].sleep : (recs[0] && recs[0].sleep);
   if (!sel || !num(sel.duration)) {
     $("sl-dur").textContent = "—";
     $("sl-hero-stats").innerHTML = "";

@@ -162,6 +162,76 @@ def _epoch_seconds(value) -> Optional[int]:
     return n
 
 
+def _sleep_day_key(sleep: dict) -> Optional[str]:
+    """Calendar day a sleep block should be filed under.
+
+    Sleep belongs to the wake/end day, not necessarily the activity dataset day.
+    This matters when the watch still advertises yesterday's daily/steps bucket
+    after midnight while returning a newly completed sleep block.
+    """
+    if not isinstance(sleep, dict):
+        return None
+    ts = _epoch_seconds(sleep.get("end")) or _epoch_seconds(sleep.get("start"))
+    if not ts:
+        return None
+    return datetime.datetime.fromtimestamp(ts).date().isoformat()
+
+
+def _same_sleep_block(a: dict, b: dict) -> bool:
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return False
+    same_window = all(
+        _epoch_seconds(a.get(k)) == _epoch_seconds(b.get(k))
+        for k in ("start", "end")
+    )
+    return same_window and str(a.get("duration")) == str(b.get("duration"))
+
+
+def _better_sleep(existing: dict, incoming: dict) -> dict:
+    if not isinstance(existing, dict) or not existing:
+        return incoming
+    if not isinstance(incoming, dict) or not incoming:
+        return existing
+    try:
+        existing_duration = int(existing.get("duration") or 0)
+        incoming_duration = int(incoming.get("duration") or 0)
+    except (TypeError, ValueError):
+        return incoming
+    if existing_duration > 0 and incoming_duration > 0 and existing_duration - incoming_duration >= 90:
+        return existing
+    return incoming
+
+
+def _repair_sleep_record_days(memory: dict) -> bool:
+    """Move sleep blocks saved under the wrong day into their wake day."""
+    records = memory.get("records") or {}
+    if not isinstance(records, dict):
+        return False
+    changed = False
+    for day, rec in list(records.items()):
+        if not isinstance(rec, dict):
+            continue
+        sleep = rec.get("sleep")
+        sleep_day = _sleep_day_key(sleep)
+        if not sleep_day or sleep_day == day:
+            continue
+        target = dict(records.get(sleep_day) or {})
+        target_sleep = target.get("sleep")
+        if isinstance(target_sleep, dict) and target_sleep and not _same_sleep_block(sleep, target_sleep):
+            continue
+        source = dict(rec)
+        source.pop("sleep", None)
+        records[day] = source
+        target["sleep"] = _better_sleep(target_sleep, sleep)
+        records[sleep_day] = target
+        if isinstance(memory.get("last_data"), dict) and memory["last_data"].get("ts") == rec.get("ts"):
+            memory["last_data"] = target
+        changed = True
+    if changed:
+        memory["records"] = records
+    return changed
+
+
 def _time_label(value) -> Optional[str]:
     ts = _epoch_seconds(value)
     if not ts:
@@ -220,6 +290,9 @@ def _normalize_sleep(d: dict) -> dict:
     out["start"] = start or out.get("start")
     out["end"] = end or out.get("end")
     out["duration"] = duration
+    sleep_day = _sleep_day_key(out)
+    if sleep_day:
+        out["day"] = sleep_day
     out["start_label"] = _time_label(start)
     out["end_label"] = _time_label(end)
     out["duration_label"] = _duration_label(duration)
@@ -516,6 +589,8 @@ class WatchService:
         self._thread.start()
         self.watch: Optional[NoiseTwist] = None
         self._memory = _load_memory()
+        if _repair_sleep_record_days(self._memory):
+            _save_memory(self._memory)
         self._bootstrap_env_integrations()
         self.token = self._memory.get("token") or DEFAULT_TOKEN
         self.connected = False
@@ -612,20 +687,42 @@ class WatchService:
                 value.pop("cached", None)
                 value.pop("cache_note", None)
         day = _day_key(data.get("ts"))
+        sleep = data.get("sleep") if isinstance(data.get("sleep"), dict) else None
+        sleep_day = _sleep_day_key(sleep) if sleep else None
+        base_data = dict(data)
+        if sleep_day and sleep_day != day:
+            base_data.pop("sleep", None)
+
         records = dict(self._memory.get("records") or {})
         existing = dict(records.get(day) or {})
         if existing:
             merged = dict(existing)
-            for key, value in data.items():
+            for key, value in base_data.items():
                 if key == "sleep" and isinstance(value, dict) and not value:
                     # Never let an empty refresh erase the last good sleep block.
                     continue
                 if value is None or value == {}:
                     continue
-                merged[key] = value
-            data = merged
-        records[day] = data
-        self._remember(last_data=data, records=records)
+                if key == "sleep":
+                    merged[key] = _better_sleep(merged.get("sleep"), value)
+                else:
+                    merged[key] = value
+            base_data = merged
+        records[day] = base_data
+
+        last_data = base_data
+        if sleep_day and sleep_day != day:
+            sleep_record = dict(records.get(sleep_day) or {})
+            if not sleep_record.get("ts"):
+                sleep_record["ts"] = datetime.datetime.combine(
+                    datetime.date.fromisoformat(sleep_day),
+                    datetime.time(),
+                ).isoformat(timespec="seconds")
+            sleep_record["sleep"] = _better_sleep(sleep_record.get("sleep"), sleep)
+            records[sleep_day] = sleep_record
+            last_data = sleep_record if sleep_day == datetime.date.today().isoformat() else base_data
+
+        self._remember(last_data=last_data, records=records)
 
     def _bootstrap_env_integrations(self):
         integrations = dict(self._memory.get("integrations") or {})
@@ -889,6 +986,8 @@ class WatchService:
             await self.ensure_connected()
 
         self._emit("status", {"state": "syncing"})
+        if self.watch:
+            self.watch.clear_fitness_cache()
 
         # File this refresh under the day the WATCH says its data is for, not the
         # Mac's clock. Right after midnight the watch still serves the previous

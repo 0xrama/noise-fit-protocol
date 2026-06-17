@@ -531,6 +531,10 @@ class NoiseTwist:
         self._fitness_timeout = _env_float("NOISE_FITNESS_TIMEOUT", 6.0)
         self._type_entries = None       # op112 cache: [(setime_bytes, ftype), ...]
 
+    def clear_fitness_cache(self):
+        """Force the next fitness pull to re-read the watch's date directory."""
+        self._type_entries = None
+
     async def connect(self) -> bool:
         # Prefer a BLEDevice from scan(); connecting by raw address can trigger
         # another slow discovery pass in bleak, especially on macOS.

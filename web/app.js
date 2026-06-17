@@ -422,6 +422,21 @@ function dayKey(ts) {
   return Number.isNaN(d.getTime()) ? String(ts).slice(0, 10) : localDateKey(d);
 }
 
+function sleepDayKey(sleep) {
+  if (!sleep || typeof sleep !== "object") return null;
+  if (sleep.day) return sleep.day;
+  const ts = sleep.end || sleep.start;
+  if (!ts) return null;
+  const d = new Date(Number(ts) * 1000);
+  return Number.isNaN(d.getTime()) ? null : localDateKey(d);
+}
+
+function betterSleep(existing, incoming) {
+  const oldMins = num(existing && existing.duration) || 0;
+  const newMins = num(incoming && incoming.duration) || 0;
+  return oldMins > 0 && newMins > 0 && oldMins - newMins >= 90 ? existing : incoming;
+}
+
 function dayLabel(key) {
   const d = new Date(key + "T12:00:00");
   if (Number.isNaN(d.getTime())) return key;
@@ -430,10 +445,22 @@ function dayLabel(key) {
 
 function rememberDayRecord(data) {
   if (!data || !data.ts || !("steps" in data || "heart" in data || "sleep" in data || "spo2" in data || "stress" in data || "standing" in data || "activity" in data)) return;
-  dayRecords[dayKey(data.ts)] = { ...(dayRecords[dayKey(data.ts)] || {}), ...data };
-  updateDayPicker(dayKey(data.ts));
+  const recordDay = dayKey(data.ts);
+  const sDay = sleepDayKey(data.sleep);
+  const baseData = { ...data };
+  if (sDay && sDay !== recordDay) delete baseData.sleep;
+  const existingRecord = dayRecords[recordDay] || {};
+  dayRecords[recordDay] = { ...existingRecord, ...baseData };
+  if (baseData.sleep) dayRecords[recordDay].sleep = betterSleep(existingRecord.sleep, baseData.sleep);
+  let selectedDay = recordDay;
+  if (sDay && sDay !== recordDay) {
+    const existing = dayRecords[sDay] || {};
+    dayRecords[sDay] = { ...existing, sleep: betterSleep(existing.sleep, data.sleep) };
+    selectedDay = sDay;
+  }
+  updateDayPicker(selectedDay);
   if (typeof renderWellness === "function") renderWellness(dayRecords);
-  if (typeof renderSleepHistory === "function") renderSleepHistory(dayRecords, dayKey(data.ts));
+  if (typeof renderSleepHistory === "function") renderSleepHistory(dayRecords, selectedDay);
 }
 
 function updateDayPicker(selected) {
@@ -448,7 +475,7 @@ function updateDayPicker(selected) {
 function renderSavedDay(day) {
   const data = dayRecords[day];
   if (!data) return;
-  render(data);
+  render({ ts: day + "T12:00:00", sleep: {}, ...data });
   const d = new Date(day + "T12:00:00");
   const label = Number.isNaN(d.getTime()) ? day : d.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" });
   $("today-date").textContent = label;
