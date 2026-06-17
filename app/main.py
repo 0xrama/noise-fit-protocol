@@ -192,6 +192,101 @@ class Bridge:
         return self._integration_call(self.service.send_latest_to_poke)
 
 
+def _find_visual_effects(root):
+    """Every NSVisualEffectView in ``root``'s view subtree (depth-first)."""
+    import AppKit
+
+    found = []
+    stack = [root]
+    while stack:
+        view = stack.pop()
+        if view is None:
+            continue
+        try:
+            if view.isKindOfClass_(AppKit.NSVisualEffectView):
+                found.append(view)
+                continue
+        except Exception:
+            pass
+        try:
+            subs = view.subviews()
+        except Exception:
+            subs = None
+        if subs:
+            stack.extend(subs)
+    return found
+
+
+def _enable_liquid_glass():
+    """Let the macOS desktop blur through the window — the "Liquid Glass" look.
+
+    pywebview 6.2.1 wires an NSVisualEffectView when ``vibrancy=True`` but never
+    makes the WKWebView transparent, so the web content paints an opaque window
+    colour straight over the blur — hiding it entirely. It also leaves the
+    vibrancy material at the system-appearance default.
+
+    We fix both. Transparency is a window/webview property and is safe to set in
+    ``BrowserView.__init__``. The vibrancy view, though, can only be positioned
+    correctly once the webview becomes the window's contentView — which pywebview
+    does asynchronously inside ``webView_didFinishNavigation:``. So we wrap that
+    delegate method to insert a single dark, always-active, behind-window
+    material directly under the content. The window keeps its native shadow
+    (unlike pywebview's ``transparent=True``, which also strips it).
+    """
+    try:
+        import AppKit
+        from webview.platforms import cocoa
+    except Exception:
+        # Not a Cocoa build — nothing to do (the app is macOS-only in practice).
+        return
+
+    hud_material = getattr(AppKit, "NSVisualEffectMaterialHUDWindow", 13)
+    original_init = cocoa.BrowserView.__init__
+    original_did_finish = cocoa.BrowserView.BrowserDelegate.webView_didFinishNavigation_
+
+    def patched_init(self, window):
+        original_init(self, window)
+        try:
+            win = self.window
+            # Window + webview transparency. setUnderPageBackgroundColor is the
+            # modern, non-deprecated way to stop WKWebView painting a background.
+            win.setOpaque_(False)
+            win.setHasShadow_(True)
+            win.setBackgroundColor_(AppKit.NSColor.clearColor())
+            self.webview.setUnderPageBackgroundColor_(AppKit.NSColor.clearColor())
+            # Legacy fallback for older WebKit builds.
+            self.webview.setValue_forKey_(True, "drawsTransparentBackground")
+        except Exception:
+            traceback.print_exc()
+
+    def patched_did_finish(self, webview, nav):
+        original_did_finish(self, webview, nav)
+        try:
+            i = cocoa.BrowserView.get_instance("webview", webview)
+            if i is None:
+                return
+            win = i.window
+            theme = webview.superview()  # the NSThemeFrame; webview is contentView here
+            if theme is None:
+                return
+            # Remove any vibrancy view pywebview mis-inserted as a webview child.
+            for ve in _find_visual_effects(webview):
+                ve.removeFromSuperview()
+            ve = AppKit.NSVisualEffectView.new()
+            ve.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
+            ve.setWantsLayer_(True)
+            ve.setFrame_(webview.frame())
+            ve.setState_(AppKit.NSVisualEffectStateActive)
+            ve.setBlendingMode_(AppKit.NSVisualEffectBlendingModeBehindWindow)
+            ve.setMaterial_(hud_material)  # dark graphite over any wallpaper
+            theme.addSubview_positioned_relativeTo_(ve, AppKit.NSWindowBelow, webview)
+        except Exception:
+            traceback.print_exc()
+
+    cocoa.BrowserView.__init__ = patched_init
+    cocoa.BrowserView.BrowserDelegate.webView_didFinishNavigation_ = patched_did_finish
+
+
 def main():
     load_env_local()
     service = WatchService()
@@ -229,6 +324,7 @@ def main():
     window.events.closed += _on_closed
 
     # gui='cocoa' uses the system WebKit + AppKit window on macOS.
+    _enable_liquid_glass()
     webview.start(gui="cocoa")
     # Belt-and-suspenders: if start() ever returns normally, don't leave the
     # daemon BLE thread holding anything.
