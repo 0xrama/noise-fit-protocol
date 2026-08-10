@@ -1,0 +1,35 @@
+# Large binary files
+*.apk
+*.xapk
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+.run-app.log
+.env.local
+*.egg-info/
+dist/
+build/
+*.app/
+
+# Local private research and Bluetooth captures
+captures/
+HANDOFF.md
+NOISE_TWIST_PROTOCOL.md
+PROGRESS_LOG.md
+PRODUCT.md
+
+# Local health-data exports
+noisefit-sync-*.json
+noise-fit-sync-*.json
+
+# Local agent artifacts
+.pi-subagents/
+
+# OS
+.DS_Store
+Thumbs.db
+.firecrawl/

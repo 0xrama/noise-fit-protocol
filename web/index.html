@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>NoiseFit</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- draggable titlebar strip (sits under the native traffic lights) -->
+  <div class="titlebar"></div>
+
+  <!-- ───────────────── Connect screen ───────────────── -->
+  <section id="screen-connect" class="screen screen-connect">
+    <div class="connect-card">
+      <div class="brand">
+        <span class="wordmark">NoiseFit</span>
+        <span class="brand-rule" aria-hidden="true"></span>
+        <p class="lede">A quiet readout of your day. Connect a watch to begin.</p>
+      </div>
+
+      <button id="btn-scan" class="btn btn-primary">
+        <span class="btn-label">Scan for watch</span>
+        <span class="btn-arrow" aria-hidden="true">→</span>
+      </button>
+
+      <ul id="device-list" class="device-list" hidden></ul>
+
+      <div class="divider"><span>or enter manually</span></div>
+
+      <div class="manual">
+        <input id="manual-mac" class="field" type="text"
+               placeholder="UUID, MAC, or name" autocomplete="off" spellcheck="false" />
+        <button id="btn-connect-manual" class="btn btn-ghost">Connect</button>
+      </div>
+
+      <div id="token-panel" class="token-panel">
+        <label class="token-label" for="pairing-token">Pairing token</label>
+        <input id="pairing-token" class="field" type="password"
+               placeholder="Token for your own watch" autocomplete="off" spellcheck="false" />
+        <p class="token-help">Required unless you set NOISE_TOKEN locally. This app does not provide a token.</p>
+      </div>
+
+      <div id="connect-status" class="connect-status"></div>
+    </div>
+    <footer class="footer">Reverse-engineered BLE client · runs entirely on your Mac</footer>
+  </section>
+
+  <!-- ───────────────── Dashboard ───────────────── -->
+  <section id="screen-dash" class="screen screen-dash" hidden>
+    <aside class="sidebar">
+      <div class="device-id">
+        <span class="device-dot" aria-hidden="true"></span>
+        <div class="device-text">
+          <span id="dev-name" class="dev-name">NoiseFit</span>
+          <span id="dev-meta" class="dev-meta"></span>
+        </div>
+      </div>
+
+      <div id="battery" class="battery-tile" title="Battery">
+        <div class="battery-head">
+          <span class="tile-label">Battery</span>
+          <span id="batt-pct" class="batt-pct">—</span>
+        </div>
+        <div class="batt-shell"><div id="batt-fill" class="batt-fill"></div></div>
+      </div>
+
+      <nav class="page-nav" id="page-nav">
+        <button class="page-tab is-active" data-page="overview"><span class="tab-ico">◎</span>Overview</button>
+        <button class="page-tab" data-page="sleep"><span class="tab-ico">☾</span>Sleep</button>
+        <button class="page-tab" data-page="heart"><span class="tab-ico">♥</span>Heart rate</button>
+        <button class="page-tab" data-page="steps"><span class="tab-ico">⊝</span>Steps</button>
+        <button class="page-tab" data-page="activity"><span class="tab-ico">⟁</span>Activity</button>
+        <button class="page-tab" data-page="weekly"><span class="tab-ico">▦</span>Weekly review</button>
+        <button class="page-tab" data-page="healthspan"><span class="tab-ico">∞</span>Healthspan</button>
+      </nav>
+
+      <nav class="side-actions">
+        <button id="btn-refresh" class="side-btn"><span class="side-ico">↻</span>Refresh data</button>
+        <button id="btn-sync-time" class="side-btn"><span class="side-ico">◷</span>Sync time</button>
+        <button id="btn-sync-export" class="side-btn"><span class="side-ico">⇧</span>Export sync file</button>
+        <button id="btn-sync-import" class="side-btn"><span class="side-ico">⇩</span>Import sync file</button>
+        <button id="btn-google-fit" class="side-btn"><span class="side-ico">G</span>Sync to Google Fit</button>
+        <button id="btn-poke" class="side-btn"><span class="side-ico">✦</span>Send data to Poke</button>
+        <button id="btn-disconnect" class="side-btn side-btn-quiet"><span class="side-ico">⏏</span>Disconnect</button>
+        <input id="sync-file-input" type="file" accept="application/json,.json" hidden />
+      </nav>
+
+      <div class="autosync" id="autosync">
+        <div class="autosync-row">
+          <span class="tile-label">Auto-sync</span>
+          <button id="autosync-onopen" class="switch" role="switch" aria-checked="false" aria-label="Sync when the app opens"><span class="switch-knob"></span></button>
+        </div>
+        <span class="autosync-hint">Sync each time the app opens</span>
+        <div class="autosync-row autosync-interval">
+          <span class="autosync-sub">Keep syncing</span>
+          <select id="autosync-interval" class="autosync-select" title="Sync repeatedly while open">
+            <option value="0">Off</option>
+            <option value="5">Every 5 min</option>
+            <option value="10">Every 10 min</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="side-foot" id="side-foot">Connected</div>
+    </aside>
+
+    <main class="content">
+      <header class="content-head">
+        <div>
+          <span id="today-date" class="today-date"></span>
+          <h2 id="greeting" class="greeting">Today</h2>
+        </div>
+        <select id="day-picker" class="day-picker" title="Saved days" hidden></select>
+      </header>
+
+      <div class="page-view is-active" id="page-overview">
+      <div id="grid" class="grid">
+        <!-- Steps (wide) -->
+        <article class="card span-2 drill" data-page="steps" id="card-steps" style="--i:0">
+          <div class="card-head"><span class="card-title">Steps</span><span class="card-sub" id="steps-sub"></span></div>
+          <div class="metric"><span id="steps-total" class="metric-num">—</span><span class="metric-unit">steps today</span></div>
+          <div class="chart" id="chart-steps"></div>
+          <div class="card-foot" id="steps-foot"></div>
+        </article>
+
+        <!-- Heart rate (wide) -->
+        <article class="card span-2 drill" data-page="heart" id="card-hr" style="--i:1">
+          <div class="card-head"><span class="card-title">Heart rate</span><span class="card-sub" id="hr-sub"></span></div>
+          <div class="metric"><span id="hr-latest" class="metric-num">—</span><span class="metric-unit">bpm</span></div>
+          <div class="chart" id="chart-hr"></div>
+          <div class="card-foot" id="hr-foot"></div>
+        </article>
+
+        <!-- Sleep -->
+        <article class="card span-2 drill" data-page="sleep" id="card-sleep" style="--i:2">
+          <div class="card-head"><span class="card-title">Sleep</span></div>
+          <div class="metric"><span id="sleep-dur" class="metric-num">—</span></div>
+          <div class="sleep-insight">
+            <div class="mini-stat"><span id="sleep-quality" class="mini-num">—</span><span class="mini-label">quality</span></div>
+            <div class="mini-stat"><span id="sleep-quality-label" class="mini-num mini-text">—</span><span class="mini-label">rating</span></div>
+          </div>
+          <div class="sleep-bar" id="sleep-bar"></div>
+          <div class="sleep-chart" id="sleep-chart"></div>
+          <div class="sleep-legend" id="sleep-legend"></div>
+          <div class="sleep-detail" id="sleep-detail"></div>
+          <div class="card-foot" id="sleep-foot"></div>
+        </article>
+
+        <!-- Sleep history -->
+        <article class="card span-2" id="card-sleep-history" style="--i:3">
+          <div class="card-head"><span class="card-title">Sleep history</span><span class="card-sub" id="sleep-history-sub"></span></div>
+          <div class="sleep-history-summary" id="sleep-history-summary"></div>
+          <div class="sleep-history" id="sleep-history"></div>
+          <div class="card-foot" id="sleep-history-foot"></div>
+        </article>
+
+        <!-- Stress -->
+        <article class="card card-ring" id="card-stress" style="--i:4">
+          <div class="card-head"><span class="card-title">Stress</span></div>
+          <div class="ring-wrap">
+            <div class="ring" id="stress-ring"></div>
+            <div class="ring-center"><span id="stress-latest" class="metric-num">—</span></div>
+          </div>
+          <div class="card-foot" id="stress-foot"></div>
+        </article>
+
+        <!-- Calories / distance -->
+        <article class="card" id="card-activity" style="--i:5">
+          <div class="card-head"><span class="card-title">Activity</span></div>
+          <div class="stack">
+            <div class="stat"><span id="act-dist" class="stat-num">—</span><span class="stat-label">distance</span></div>
+            <div class="stat"><span id="act-cal" class="stat-num">—</span><span class="stat-label">calories</span></div>
+            <div class="stat"><span id="act-standing" class="stat-num">—</span><span class="stat-label">active hours</span></div>
+            <div class="stat"><span id="act-duration" class="stat-num">—</span><span class="stat-label">activity duration</span></div>
+          </div>
+        </article>
+
+        <!-- SpO2 -->
+        <article class="card" id="card-spo2" style="--i:6">
+          <div class="card-head"><span class="card-title">Blood oxygen</span></div>
+          <div class="metric"><span id="spo2-latest" class="metric-num">—</span><span class="metric-unit">%</span></div>
+          <div class="card-foot" id="spo2-foot"></div>
+        </article>
+
+        <!-- Recovery — appears after 20 valid days -->
+        <article class="card card-ring" id="card-recovery" style="--i:7" hidden>
+          <div class="card-head"><span class="card-title">Recovery</span><span class="card-sub" id="recovery-window"></span></div>
+          <div class="ring-wrap">
+            <div class="ring" id="recovery-ring"></div>
+            <div class="ring-center"><span id="recovery-score" class="metric-num">—</span></div>
+          </div>
+          <div class="card-foot" id="recovery-foot"></div>
+        </article>
+
+        <!-- Healthspan teaser — drills into the full page -->
+        <article class="card drill" data-page="healthspan" id="card-healthspan" style="--i:8">
+          <div class="card-head"><span class="card-title">Healthspan</span><span class="card-sub" id="hs-card-sub"></span></div>
+          <div class="metric"><span id="hs-card-age" class="metric-num">—</span><span class="metric-unit">whoop age</span></div>
+          <div class="card-foot" id="hs-card-foot">Biological age estimate</div>
+        </article>
+      </div>
+      </div><!-- /#page-overview -->
+
+      <!-- ───────── Sleep page ───────── -->
+      <section class="page-view" id="page-sleep">
+        <div class="detail-hero">
+          <div class="hero-num"><span id="sl-dur" class="metric-num">—</span><span class="metric-unit">last night</span></div>
+          <div class="hero-stats" id="sl-hero-stats"></div>
+        </div>
+        <div class="panel-grid">
+          <article class="panel span-2"><div class="panel-head">Stage timeline</div><div class="sleep-chart" id="sl-timeline"></div><div class="sleep-legend" id="sl-legend"></div></article>
+          <article class="panel span-2"><div class="panel-head">Duration trend</div><div class="trend" id="sl-dur-trend"></div><div class="panel-foot" id="sl-dur-foot"></div></article>
+          <article class="panel span-2"><div class="panel-head">Sleep quality trend</div><div class="trend" id="sl-qual-trend"></div><div class="panel-foot" id="sl-qual-foot"></div></article>
+          <article class="panel span-2"><div class="panel-head">Bedtime consistency</div><div class="scatter" id="sl-consistency"></div><div class="panel-foot" id="sl-consistency-foot"></div></article>
+          <article class="panel span-2"><div class="panel-head">Stage mix</div><div class="stage-mix" id="sl-stage-mix"></div></article>
+        </div>
+      </section>
+
+      <!-- ───────── Heart rate page ───────── -->
+      <section class="page-view" id="page-heart">
+        <div class="detail-hero">
+          <div class="hero-num"><span id="hr-now" class="metric-num">—</span><span class="metric-unit">bpm now</span></div>
+          <div class="hero-stats" id="hr-hero-stats"></div>
+        </div>
+        <div class="panel-grid">
+          <article class="panel span-4"><div class="panel-head">Today · 5-minute samples</div><div class="trend tall" id="hr-day"></div></article>
+          <article class="panel span-2"><div class="panel-head">Resting heart rate trend</div><div class="trend" id="hr-resting-trend"></div><div class="panel-foot" id="hr-resting-foot"></div></article>
+          <article class="panel span-2"><div class="panel-head">Daily range (min · max)</div><div class="trend" id="hr-envelope"></div><div class="panel-foot" id="hr-env-foot"></div></article>
+        </div>
+      </section>
+
+      <!-- ───────── Steps page ───────── -->
+      <section class="page-view" id="page-steps">
+        <div class="detail-hero">
+          <div class="hero-num"><span id="st-total" class="metric-num">—</span><span class="metric-unit">steps today</span></div>
+          <div class="hero-stats" id="st-hero-stats"></div>
+        </div>
+        <div class="panel-grid">
+          <article class="panel span-4"><div class="panel-head">Today · hourly</div><div class="trend tall" id="st-hourly"></div></article>
+          <article class="panel span-2"><div class="panel-head">Daily steps trend</div><div class="trend" id="st-trend"></div><div class="panel-foot" id="st-trend-foot"></div></article>
+          <article class="panel span-2"><div class="panel-head">Distance trend</div><div class="trend" id="st-dist-trend"></div><div class="panel-foot" id="st-dist-foot"></div></article>
+        </div>
+      </section>
+
+      <!-- ───────── Activity page ───────── -->
+      <section class="page-view" id="page-activity">
+        <div class="detail-hero">
+          <div class="hero-num"><span id="ac-dist" class="metric-num">—</span><span class="metric-unit">distance today</span></div>
+          <div class="hero-stats" id="ac-hero-stats"></div>
+        </div>
+        <div class="panel-grid">
+          <article class="panel span-2"><div class="panel-head">Calories trend</div><div class="trend" id="ac-cal-trend"></div><div class="panel-foot" id="ac-cal-foot"></div></article>
+          <article class="panel span-2"><div class="panel-head">Distance trend</div><div class="trend" id="ac-dist-trend"></div><div class="panel-foot" id="ac-dist-foot"></div></article>
+          <article class="panel span-2"><div class="panel-head">Active hours trend</div><div class="trend" id="ac-standing-trend"></div><div class="panel-foot" id="ac-standing-foot"></div></article>
+          <article class="panel span-2"><div class="panel-head">Activity duration trend</div><div class="trend" id="ac-duration-trend"></div><div class="panel-foot" id="ac-duration-foot"></div></article>
+          <article class="panel span-4"><div class="panel-head">Weekly movement</div><div class="trend" id="ac-weekly"></div><div class="panel-foot" id="ac-weekly-foot"></div></article>
+        </div>
+      </section>
+
+      <!-- ───────── Weekly review page ───────── -->
+      <section class="page-view" id="page-weekly">
+        <div class="detail-hero">
+          <div class="hero-num"><span id="wk-range" class="metric-num">This week</span><span class="metric-unit" id="wk-range-sub"></span></div>
+          <div class="hero-stats" id="wk-hero-stats"></div>
+        </div>
+        <div class="panel-grid">
+          <article class="panel span-4"><div class="panel-head">Steps · across the week</div><div class="trend tall" id="wk-steps"></div><div class="panel-foot" id="wk-steps-foot"></div></article>
+          <article class="panel span-4"><div class="panel-head">Sleep · across the week</div><div class="trend tall" id="wk-sleep"></div><div class="panel-foot" id="wk-sleep-foot"></div></article>
+          <article class="panel span-4"><div class="panel-head">Activity score · across the week</div><div class="trend tall" id="wk-activity"></div><div class="panel-foot" id="wk-activity-foot"></div></article>
+        </div>
+      </section>
+
+      <!-- ───────── Healthspan page ───────── -->
+      <section class="page-view" id="page-healthspan">
+        <div id="hs-body"></div>
+      </section>
+
+    <div id="toast" class="toast" hidden></div>
+  </section>
+
+  <script src="app.js"></script>
+  <script src="charts.js"></script>
+  <script src="pages.js"></script>
+</body>
+</html>
