@@ -16,6 +16,8 @@ build/
 *.app/
 
 # Local private research and Bluetooth captures
+.analysis/
+noise-fit-protocol-private-pre-public.bundle
 captures/
 HANDOFF.md
 NOISE_TWIST_PROTOCOL.md
